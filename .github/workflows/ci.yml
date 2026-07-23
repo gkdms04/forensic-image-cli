@@ -43,26 +43,34 @@ jobs:
           qemu-img convert -f raw -O vmdk -o subformat=monolithicSparse \
             /tmp/fimg.raw /tmp/fimg.vmdk
           ewfacquire -u -q -c fast -t /tmp/fimg /tmp/fimg.raw
-      - name: Create FAT32 and exFAT fixtures
+      - name: Create FAT32 fixture (mtools, no mount)
         run: |
           set -euo pipefail
           truncate -s 48M /tmp/fat32.raw
           mkfs.fat -F32 /tmp/fat32.raw
           MTOOLS_SKIP_CHECK=1 mmd -i /tmp/fat32.raw ::docs
           MTOOLS_SKIP_CHECK=1 mcopy -i /tmp/fat32.raw README.md ::docs/README.md
+      - name: Create exFAT fixture (best-effort; needs kernel exfat)
+        run: |
           truncate -s 48M /tmp/exfat.raw
           mkfs.exfat /tmp/exfat.raw
           mkdir -p /tmp/mnt
-          sudo mount -o loop /tmp/exfat.raw /tmp/mnt
-          sudo mkdir -p /tmp/mnt/docs
-          sudo cp README.md /tmp/mnt/docs/README.md
-          sudo sync && sudo umount /tmp/mnt
-      - name: Create NTFS fixture with a deleted file
+          sudo modprobe exfat 2>/dev/null || true
+          if sudo mount -t exfat -o loop /tmp/exfat.raw /tmp/mnt; then
+            sudo mkdir -p /tmp/mnt/docs
+            sudo cp README.md /tmp/mnt/docs/README.md
+            sudo sync && sudo umount /tmp/mnt
+          else
+            echo "exfat mount unavailable on this runner; skipping exFAT fixture"
+            rm -f /tmp/exfat.raw
+          fi
+      - name: Create NTFS fixture with a deleted file (ntfs-3g)
         run: |
           set -euo pipefail
           truncate -s 48M /tmp/ntfs.raw
           mkfs.ntfs -F -Q /tmp/ntfs.raw
-          sudo mount -o loop /tmp/ntfs.raw /tmp/mnt
+          mkdir -p /tmp/mnt
+          sudo mount -t ntfs-3g -o loop /tmp/ntfs.raw /tmp/mnt
           sudo mkdir -p /tmp/mnt/docs
           sudo cp README.md /tmp/mnt/docs/README.md
           echo deleted-evidence | sudo tee /tmp/mnt/docs/secret.txt >/dev/null
@@ -71,8 +79,9 @@ jobs:
       - name: Browse and extract every format
         run: |
           set -euo pipefail
-          for image in /tmp/fimg.raw /tmp/fimg.vmdk /tmp/fimg.E01 \
-                       /tmp/fat32.raw /tmp/exfat.raw /tmp/ntfs.raw; do
+          images="/tmp/fimg.raw /tmp/fimg.vmdk /tmp/fimg.E01 /tmp/fat32.raw /tmp/ntfs.raw"
+          [ -f /tmp/exfat.raw ] && images="$images /tmp/exfat.raw"
+          for image in $images; do
             target/debug/fimg tree "$image" --max-depth 3 | grep "README.md"
             target/debug/fimg find "$image" '(?i)readme[.]md' | grep "/docs/README.md"
             target/debug/fimg stat "$image" /docs/README.md --json | grep '"size"'
