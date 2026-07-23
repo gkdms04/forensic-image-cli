@@ -540,7 +540,7 @@ fn command_timeline(
                 writeln!(
                     out,
                     "0|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-                    entry.path,
+                    bodyfile_name(&entry.path),
                     entry.ino,
                     entry.mode.unwrap_or(0),
                     entry.uid.unwrap_or(0),
@@ -741,6 +741,69 @@ fn csv_field(value: &str) -> String {
     }
 }
 
+/// Sanitize a path for a Sleuth Kit bodyfile `name` field.
+///
+/// The bodyfile format is `|`-delimited with one record per line and defines no
+/// quoting, so a path containing `|`, CR, or LF would inject an extra field or
+/// terminate the record early and desync downstream `mactime` parsing.
+/// Percent-encode exactly those bytes — plus `%` itself, so the mapping stays
+/// reversible — and pass every other character through unchanged.
+fn bodyfile_name(value: &str) -> String {
+    if !value.contains(['%', '|', '\n', '\r']) {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '|' => out.push_str("%7C"),
+            '\r' => out.push_str("%0D"),
+            '\n' => out.push_str("%0A"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn hex_digest(digest: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bodyfile_name, csv_field};
+
+    #[test]
+    fn bodyfile_name_passes_ordinary_paths_through() {
+        assert_eq!(
+            bodyfile_name("/docs/report final.txt"),
+            "/docs/report final.txt"
+        );
+    }
+
+    #[test]
+    fn bodyfile_name_encodes_delimiter_and_line_breaks() {
+        assert_eq!(bodyfile_name("/tmp/a|b\r\nc"), "/tmp/a%7Cb%0D%0Ac");
+    }
+
+    #[test]
+    fn bodyfile_name_keeps_encoding_reversible_via_percent() {
+        // A literal "%7C" must not be indistinguishable from an encoded '|'.
+        assert_eq!(bodyfile_name("a%7Cb"), "a%257Cb");
+        assert_eq!(bodyfile_name("a|b"), "a%7Cb");
+    }
+
+    #[test]
+    fn encoded_bodyfile_name_stays_a_single_field_on_one_line() {
+        let record = format!("0|{}|1|2|3|4|5|6|7|8|9", bodyfile_name("x|y\nz"));
+        assert_eq!(record.matches('|').count(), 10, "exactly 11 fields");
+        assert_eq!(record.lines().count(), 1, "one record per line");
+    }
+
+    #[test]
+    fn csv_field_quotes_only_when_needed() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("she said \"hi\""), "\"she said \"\"hi\"\"\"");
+    }
 }
