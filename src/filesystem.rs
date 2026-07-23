@@ -3,7 +3,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use forensic_vfs::{DynFs, FileId, FileSystem, FsMeta, NodeKind, StreamId};
+use forensic_vfs::{Allocation, DynFs, FileId, FileSystem, FsMeta, MacbTimes, NodeKind, StreamId};
 use sha2::{Digest, Sha256};
 
 use crate::image::{ImageFactory, WindowReader};
@@ -16,6 +16,7 @@ const MAX_DIRECTORY_ENTRIES: usize = 1_000_000;
 pub enum FileSystemKind {
     Ntfs,
     Ext,
+    Fat,
     Iso9660,
     Unknown,
 }
@@ -25,20 +26,38 @@ impl std::fmt::Display for FileSystemKind {
         match self {
             Self::Ntfs => formatter.write_str("NTFS"),
             Self::Ext => formatter.write_str("ext2/3/4"),
+            Self::Fat => formatter.write_str("FAT/exFAT"),
             Self::Iso9660 => formatter.write_str("ISO 9660"),
             Self::Unknown => formatter.write_str("unknown"),
         }
     }
 }
 
+/// A deleted or orphaned node recovered from a filesystem, merged from the
+/// bare-[`FsMeta`] and rich [`forensic_vfs::DeletedNode`] surfaces.
+#[derive(Debug, Clone)]
+pub struct DeletedEntry {
+    pub ino: u64,
+    pub name: Option<String>,
+    pub kind: NodeKind,
+    pub allocated: Allocation,
+    pub size: u64,
+    pub times: MacbTimes,
+}
+
 #[derive(Debug, Clone)]
 pub struct WalkEntry {
     pub id: FileId,
+    pub ino: u64,
     pub path: String,
     pub name: String,
     pub depth: usize,
     pub kind: NodeKind,
     pub size: u64,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub mode: Option<u32>,
+    pub times: MacbTimes,
     pub is_last: bool,
     pub ancestor_is_last: Vec<bool>,
 }
@@ -70,6 +89,10 @@ pub fn open_partition_filesystem(
         FileSystemKind::Ext => Arc::new(
             ext4fs::Ext4Fs::open(reader)
                 .with_context(|| format!("cannot open ext filesystem in p{}", partition.number))?,
+        ),
+        FileSystemKind::Fat => Arc::new(
+            fatfs::FatFs::open(reader)
+                .with_context(|| format!("cannot open FAT/exFAT in p{}", partition.number))?,
         ),
         FileSystemKind::Iso9660 => Arc::new(
             iso9660_forensic::vfs::IsoVfs::open(reader)
@@ -104,6 +127,18 @@ pub fn detect_filesystem<R: Read + Seek>(reader: &mut R) -> Result<FileSystemKin
     reader.seek(SeekFrom::Start(16 * 2048 + 1))?;
     if reader.read_exact(&mut iso_magic).is_ok() && &iso_magic == b"CD001" {
         return Ok(FileSystemKind::Iso9660);
+    }
+
+    // FAT/exFAT: gated on the 0x55AA boot signature, then the exFAT OEM name at
+    // offset 3 or the FAT filesystem-type label (FAT12/16 at 0x36, FAT32 at
+    // 0x52). fat-core's open() performs the authoritative BPB validation.
+    if boot_len >= 512 && boot[510] == 0x55 && boot[511] == 0xaa {
+        let is_exfat = &boot[3..11] == b"EXFAT   ";
+        let fat1x = matches!(&boot[54..62], b"FAT12   " | b"FAT16   " | b"FAT     ");
+        let fat32 = &boot[82..90] == b"FAT32   ";
+        if is_exfat || fat1x || fat32 {
+            return Ok(FileSystemKind::Fat);
+        }
     }
 
     Ok(FileSystemKind::Unknown)
@@ -187,11 +222,16 @@ fn walk_directory(
             .with_context(|| format!("cannot read metadata for '{path}'"))?;
         let record = WalkEntry {
             id: entry.id,
+            ino: meta.ino,
             path: path.clone(),
             name,
             depth: depth + 1,
             kind: entry.kind,
             size: meta.size,
+            uid: meta.uid,
+            gid: meta.gid,
+            mode: meta.mode,
+            times: meta.times,
             is_last,
             ancestor_is_last: ancestor_is_last.clone(),
         };
@@ -275,6 +315,61 @@ pub fn copy_file(
     Ok(digest.finalize().into())
 }
 
+/// Enumerate deleted and orphaned nodes, merging the rich
+/// [`FileSystem::deleted_nodes`] surface (identity + recovered name, e.g. NTFS)
+/// with the bare [`FileSystem::deleted`] surface (ext/ISO/FAT), deduplicated by
+/// metadata address. The traversal is bounded like directory walks.
+pub fn list_deleted(filesystem: &dyn FileSystem) -> Result<Vec<DeletedEntry>> {
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+
+    for node in filesystem
+        .deleted_nodes()
+        .context("cannot enumerate deleted nodes")?
+    {
+        let node = node.context("cannot read deleted node")?;
+        if !seen.insert(node.meta.ino) {
+            continue;
+        }
+        let name =
+            (!node.name.is_empty()).then(|| String::from_utf8_lossy(&node.name).into_owned());
+        entries.push(DeletedEntry {
+            ino: node.meta.ino,
+            name,
+            kind: node.meta.kind,
+            allocated: node.meta.allocated,
+            size: node.meta.size,
+            times: node.meta.times,
+        });
+        if entries.len() > MAX_DIRECTORY_ENTRIES {
+            bail!("deleted-node limit exceeded ({MAX_DIRECTORY_ENTRIES})");
+        }
+    }
+
+    for meta in filesystem
+        .deleted()
+        .context("cannot enumerate deleted metadata")?
+    {
+        let meta = meta.context("cannot read deleted metadata")?;
+        if !seen.insert(meta.ino) {
+            continue;
+        }
+        entries.push(DeletedEntry {
+            ino: meta.ino,
+            name: None,
+            kind: meta.kind,
+            allocated: meta.allocated,
+            size: meta.size,
+            times: meta.times,
+        });
+        if entries.len() > MAX_DIRECTORY_ENTRIES {
+            bail!("deleted-node limit exceeded ({MAX_DIRECTORY_ENTRIES})");
+        }
+    }
+
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -285,7 +380,53 @@ mod tests {
         VfsResult,
     };
 
-    use super::{resolve_path, walk_filesystem};
+    use super::{FileSystemKind, detect_filesystem, resolve_path, walk_filesystem};
+
+    #[test]
+    fn detects_exfat_by_oem_signature() {
+        let mut boot = vec![0_u8; 512];
+        boot[3..11].copy_from_slice(b"EXFAT   ");
+        boot[510] = 0x55;
+        boot[511] = 0xaa;
+        assert_eq!(
+            detect_filesystem(&mut std::io::Cursor::new(boot)).unwrap(),
+            FileSystemKind::Fat
+        );
+    }
+
+    #[test]
+    fn detects_fat32_by_type_label() {
+        let mut boot = vec![0_u8; 512];
+        boot[82..90].copy_from_slice(b"FAT32   ");
+        boot[510] = 0x55;
+        boot[511] = 0xaa;
+        assert_eq!(
+            detect_filesystem(&mut std::io::Cursor::new(boot)).unwrap(),
+            FileSystemKind::Fat
+        );
+    }
+
+    #[test]
+    fn detects_fat16_by_type_label() {
+        let mut boot = vec![0_u8; 512];
+        boot[54..62].copy_from_slice(b"FAT16   ");
+        boot[510] = 0x55;
+        boot[511] = 0xaa;
+        assert_eq!(
+            detect_filesystem(&mut std::io::Cursor::new(boot)).unwrap(),
+            FileSystemKind::Fat
+        );
+    }
+
+    #[test]
+    fn unsigned_boot_sector_is_not_fat() {
+        let mut boot = vec![0_u8; 512];
+        boot[82..90].copy_from_slice(b"FAT32   "); // label present, signature absent
+        assert_eq!(
+            detect_filesystem(&mut std::io::Cursor::new(boot)).unwrap(),
+            FileSystemKind::Unknown
+        );
+    }
 
     struct MockFs {
         dirs: HashMap<FileId, Vec<DirEntry>>,

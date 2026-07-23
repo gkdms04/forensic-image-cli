@@ -15,6 +15,7 @@ anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 ewf = "0.2.3"
 ext4fs-core = { version = "0.2.6", default-features = false, features = ["vfs"] }
+fatfs = { package = "fat-core", version = "0.1", features = ["vfs"] }
 forensic-vfs = "0.7.0"
 iso9660-forensic = { version = "0.7.5", features = ["vfs"] }
 ntfs-core = { version = "0.9.6", features = ["vfs"] }

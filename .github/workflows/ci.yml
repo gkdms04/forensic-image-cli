@@ -30,10 +30,11 @@ jobs:
       - name: Install fixture tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y e2fsprogs ewf-tools qemu-utils
+          sudo apt-get install -y e2fsprogs ewf-tools qemu-utils dosfstools \
+            exfatprogs ntfs-3g mtools
       - name: Build native CLI
         run: cargo build
-      - name: Create filesystem and container fixtures
+      - name: Create container fixtures (raw ext4, VMDK, E01)
         run: |
           truncate -s 32M /tmp/fimg.raw
           mkfs.ext4 -q /tmp/fimg.raw
@@ -42,14 +43,45 @@ jobs:
           qemu-img convert -f raw -O vmdk -o subformat=monolithicSparse \
             /tmp/fimg.raw /tmp/fimg.vmdk
           ewfacquire -u -q -c fast -t /tmp/fimg /tmp/fimg.raw
+      - name: Create FAT32 and exFAT fixtures
+        run: |
+          set -euo pipefail
+          truncate -s 48M /tmp/fat32.raw
+          mkfs.fat -F32 /tmp/fat32.raw
+          MTOOLS_SKIP_CHECK=1 mmd -i /tmp/fat32.raw ::docs
+          MTOOLS_SKIP_CHECK=1 mcopy -i /tmp/fat32.raw README.md ::docs/README.md
+          truncate -s 48M /tmp/exfat.raw
+          mkfs.exfat /tmp/exfat.raw
+          mkdir -p /tmp/mnt
+          sudo mount -o loop /tmp/exfat.raw /tmp/mnt
+          sudo mkdir -p /tmp/mnt/docs
+          sudo cp README.md /tmp/mnt/docs/README.md
+          sudo sync && sudo umount /tmp/mnt
+      - name: Create NTFS fixture with a deleted file
+        run: |
+          set -euo pipefail
+          truncate -s 48M /tmp/ntfs.raw
+          mkfs.ntfs -F -Q /tmp/ntfs.raw
+          sudo mount -o loop /tmp/ntfs.raw /tmp/mnt
+          sudo mkdir -p /tmp/mnt/docs
+          sudo cp README.md /tmp/mnt/docs/README.md
+          echo deleted-evidence | sudo tee /tmp/mnt/docs/secret.txt >/dev/null
+          sudo sync && sudo rm /tmp/mnt/docs/secret.txt
+          sudo sync && sudo umount /tmp/mnt
       - name: Browse and extract every format
         run: |
           set -euo pipefail
-          for image in /tmp/fimg.raw /tmp/fimg.vmdk /tmp/fimg.E01; do
+          for image in /tmp/fimg.raw /tmp/fimg.vmdk /tmp/fimg.E01 \
+                       /tmp/fat32.raw /tmp/exfat.raw /tmp/ntfs.raw; do
             target/debug/fimg tree "$image" --max-depth 3 | grep "README.md"
             target/debug/fimg find "$image" '(?i)readme[.]md' | grep "/docs/README.md"
+            target/debug/fimg stat "$image" /docs/README.md --json | grep '"size"'
+            target/debug/fimg timeline "$image" --bodyfile | grep "/docs/README.md"
             target/debug/fimg extract "$image" /docs/README.md \
               --output /tmp/extracted.md --overwrite
             cmp /tmp/extracted.md README.md
+            target/debug/fimg info "$image" --json | grep '"container"'
           done
+      - name: Recover the deleted NTFS file
+        run: target/debug/fimg deleted /tmp/ntfs.raw | grep "secret.txt"
 
