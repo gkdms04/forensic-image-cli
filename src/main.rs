@@ -1,5 +1,6 @@
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -29,6 +30,9 @@ struct Cli {
     /// Emit machine-readable JSON instead of text.
     #[arg(long, global = true)]
     json: bool,
+    /// Print a scan progress heartbeat to stderr (full-walk commands only).
+    #[arg(long, global = true)]
+    progress: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -117,6 +121,7 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let format = OutputFormat::from_json_flag(cli.json);
+    let progress = cli.progress;
     match cli.command {
         Command::Info { image } => command_info(&image, format),
         Command::Partitions { image } => command_partitions(&image, format),
@@ -124,13 +129,13 @@ fn main() -> Result<()> {
             image,
             partition,
             max_depth,
-        } => command_tree(&image, partition, max_depth, format),
+        } => command_tree(&image, partition, max_depth, progress, format),
         Command::Find {
             image,
             pattern,
             partition,
             ignore_case,
-        } => command_find(&image, &pattern, partition, ignore_case, format),
+        } => command_find(&image, &pattern, partition, ignore_case, progress, format),
         Command::Stat {
             image,
             path,
@@ -140,8 +145,10 @@ fn main() -> Result<()> {
             image,
             partition,
             bodyfile,
-        } => command_timeline(&image, partition, bodyfile, format),
-        Command::Deleted { image, partition } => command_deleted(&image, partition, format),
+        } => command_timeline(&image, partition, bodyfile, progress, format),
+        Command::Deleted { image, partition } => {
+            command_deleted(&image, partition, progress, format)
+        }
         Command::Extract {
             image,
             path,
@@ -180,6 +187,75 @@ fn select_partitions(
             Ok(vec![partition])
         }
         None => Ok(partitions.iter().collect()),
+    }
+}
+
+/// Opt-in scan heartbeat on stderr for the full-filesystem-walk commands.
+///
+/// `tree`, `find`, `timeline`, and `deleted` buffer their results and can run
+/// for minutes on a large E01 with no output at all; `--progress` emits a
+/// throttled entry count so the operator knows the scan is alive. It writes only
+/// to stderr, leaving stdout data (tree/CSV/JSON) untouched: when stderr is a
+/// terminal it repaints one line in place with a carriage return, otherwise it
+/// emits plain lines suitable for a redirected log. Repaints are throttled to at
+/// most one every 200 ms; `finish` prints the final total.
+struct Progress {
+    enabled: bool,
+    tty: bool,
+    count: u64,
+    partition: usize,
+    last: Instant,
+}
+
+impl Progress {
+    fn new(enabled: bool) -> Self {
+        Progress {
+            enabled,
+            tty: std::io::stderr().is_terminal(),
+            count: 0,
+            partition: 0,
+            last: Instant::now(),
+        }
+    }
+
+    /// Count one visited entry, repainting at most every 200 ms.
+    fn tick(&mut self, partition: usize) {
+        if !self.enabled {
+            return;
+        }
+        self.count += 1;
+        self.partition = partition;
+        let now = Instant::now();
+        if now.duration_since(self.last) >= Duration::from_millis(200) {
+            self.last = now;
+            self.emit(false);
+        }
+    }
+
+    fn message(&self) -> String {
+        format!("scanning p{}: {} entries", self.partition, self.count)
+    }
+
+    fn emit(&self, final_line: bool) {
+        let mut stderr = std::io::stderr().lock();
+        if self.tty {
+            // Repaint in place; pad to overwrite a previously longer line.
+            let _ = write!(stderr, "\r{:<60}", self.message());
+            if final_line {
+                let _ = writeln!(stderr);
+            }
+        } else {
+            let _ = writeln!(stderr, "{}", self.message());
+        }
+        let _ = stderr.flush();
+    }
+
+    /// Emit the final total and terminate the progress line.
+    fn finish(&self) {
+        if !self.enabled || self.count == 0 {
+            return;
+        }
+        self.emit(true);
     }
 }
 
@@ -301,10 +377,12 @@ fn command_tree(
     image: &Path,
     requested: Option<usize>,
     max_depth: Option<usize>,
+    show_progress: bool,
     format: OutputFormat,
 ) -> Result<()> {
     let (factory, partitions, _virtual_size) = image_layout(image)?;
     let mut reports = Vec::new();
+    let mut progress = Progress::new(show_progress);
     for_each_readable_partition(
         &factory,
         &partitions,
@@ -327,6 +405,7 @@ fn command_tree(
                         partition.name.as_deref().unwrap_or("")
                     );
                     walk_filesystem(filesystem.as_ref(), max_depth, |entry| {
+                        progress.tick(partition.number);
                         let mut prefix = String::new();
                         for ancestor_is_last in &entry.ancestor_is_last {
                             prefix.push_str(if *ancestor_is_last { "    " } else { "│   " });
@@ -344,6 +423,7 @@ fn command_tree(
                 OutputFormat::Json => {
                     let mut entries = Vec::new();
                     walk_filesystem(filesystem.as_ref(), max_depth, |entry| {
+                        progress.tick(partition.number);
                         entries.push(TreeNode {
                             path: entry.path.clone(),
                             name: entry.name.clone(),
@@ -364,6 +444,7 @@ fn command_tree(
             Ok(())
         },
     )?;
+    progress.finish();
     if format == OutputFormat::Json {
         print_json(&reports)?;
     }
@@ -375,6 +456,7 @@ fn command_find(
     pattern: &str,
     requested: Option<usize>,
     ignore_case: bool,
+    show_progress: bool,
     format: OutputFormat,
 ) -> Result<()> {
     let expression = RegexBuilder::new(pattern)
@@ -383,6 +465,7 @@ fn command_find(
         .with_context(|| format!("invalid regular expression: '{pattern}'"))?;
     let (factory, partitions, _virtual_size) = image_layout(image)?;
     let mut matches = Vec::new();
+    let mut progress = Progress::new(show_progress);
     for_each_readable_partition(
         &factory,
         &partitions,
@@ -390,6 +473,7 @@ fn command_find(
         |_partition| {},
         |partition, _kind, filesystem| {
             walk_filesystem(filesystem.as_ref(), None, |entry| {
+                progress.tick(partition.number);
                 if expression.is_match(&entry.path) {
                     matches.push(FindMatch {
                         partition: partition.number,
@@ -402,6 +486,7 @@ fn command_find(
             })
         },
     )?;
+    progress.finish();
 
     match format {
         OutputFormat::Json => print_json(&matches),
@@ -497,10 +582,12 @@ fn command_timeline(
     image: &Path,
     requested: Option<usize>,
     bodyfile: bool,
+    show_progress: bool,
     format: OutputFormat,
 ) -> Result<()> {
     let (factory, partitions, _virtual_size) = image_layout(image)?;
     let mut rows = Vec::new();
+    let mut progress = Progress::new(show_progress);
     for_each_readable_partition(
         &factory,
         &partitions,
@@ -508,11 +595,13 @@ fn command_timeline(
         |_partition| {},
         |partition, _kind, filesystem| {
             walk_filesystem(filesystem.as_ref(), None, |entry| {
+                progress.tick(partition.number);
                 rows.push((partition.number, entry.clone()));
                 Ok(())
             })
         },
     )?;
+    progress.finish();
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -578,9 +667,15 @@ fn command_timeline(
     }
 }
 
-fn command_deleted(image: &Path, requested: Option<usize>, format: OutputFormat) -> Result<()> {
+fn command_deleted(
+    image: &Path,
+    requested: Option<usize>,
+    show_progress: bool,
+    format: OutputFormat,
+) -> Result<()> {
     let (factory, partitions, _virtual_size) = image_layout(image)?;
     let mut rows = Vec::new();
+    let mut progress = Progress::new(show_progress);
     for_each_readable_partition(
         &factory,
         &partitions,
@@ -588,11 +683,13 @@ fn command_deleted(image: &Path, requested: Option<usize>, format: OutputFormat)
         |_partition| {},
         |partition, _kind, filesystem| {
             for entry in list_deleted(filesystem.as_ref())? {
+                progress.tick(partition.number);
                 rows.push(deleted_row(partition.number, entry));
             }
             Ok(())
         },
     )?;
+    progress.finish();
 
     match format {
         OutputFormat::Json => print_json(&rows),
@@ -771,7 +868,26 @@ fn hex_digest(digest: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{bodyfile_name, csv_field};
+    use super::{Progress, bodyfile_name, csv_field};
+
+    #[test]
+    fn progress_disabled_never_counts() {
+        let mut progress = Progress::new(false);
+        for _ in 0..5 {
+            progress.tick(0);
+        }
+        assert_eq!(progress.count, 0);
+    }
+
+    #[test]
+    fn progress_enabled_counts_and_labels_current_partition() {
+        let mut progress = Progress::new(true);
+        progress.tick(2);
+        progress.tick(2);
+        progress.tick(3);
+        assert_eq!(progress.count, 3);
+        assert_eq!(progress.message(), "scanning p3: 3 entries");
+    }
 
     #[test]
     fn bodyfile_name_passes_ordinary_paths_through() {

@@ -24,6 +24,10 @@ python scripts/fimg.py extract IMAGE /internal/path --partition 2 --output DEST
 Pass `--json` to any command for structured output that is easier to parse than
 the default text. Supported filesystems: NTFS, ext2/3/4, FAT/exFAT, ISO 9660.
 
+Pass `--progress` to print a scan heartbeat to stderr during the full-walk
+commands (`tree`, `find`, `timeline`, `deleted`); it never touches stdout, so
+piped data and JSON stay clean.
+
 Run `--install` only when the launcher reports that `fimg` is missing. It
 downloads the latest Windows or Linux x86-64 release to the user's local data
 directory.
