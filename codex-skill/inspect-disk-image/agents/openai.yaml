@@ -1,0 +1,5 @@
+interface:
+  display_name: "Forensic Disk Image Inspector"
+  short_description: "E01, VMDK, RAW 이미지를 탐색하고 파일 추출"
+  default_prompt: "Use $inspect-disk-image to inspect this forensic disk image and extract the files I request."
+
