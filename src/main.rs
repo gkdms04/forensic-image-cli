@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use forensic_image_cli::filesystem::{
     DeletedEntry, FileSystemKind, copy_file, detect_partition_filesystem, list_deleted,
-    open_partition_filesystem, try_resolve_path, walk_filesystem,
+    try_open_partition_filesystem, try_resolve_path, walk_filesystem,
 };
 use forensic_image_cli::image::ImageFactory;
 use forensic_image_cli::output::{
@@ -14,7 +14,7 @@ use forensic_image_cli::output::{
     node_kind_str, print_json, ts_unix_secs,
 };
 use forensic_image_cli::partition::{Partition, read_partitions};
-use forensic_vfs::NodeKind;
+use forensic_vfs::{DynFs, NodeKind};
 use regex::RegexBuilder;
 
 #[derive(Debug, Parser)]
@@ -183,6 +183,34 @@ fn select_partitions(
     }
 }
 
+/// Walk the selected partitions, opening each supported filesystem exactly once.
+///
+/// Centralizes the multi-partition invariant: an unsupported filesystem is a
+/// hard error when the user named a single partition (`requested.is_some()`) and
+/// is otherwise skipped, with `on_skip` invoked so callers can warn. Opening
+/// once (via `try_open_partition_filesystem`) replaces the former detect-then-open
+/// pair, halving container opens on the reopen-per-operation path.
+fn for_each_readable_partition(
+    factory: &ImageFactory,
+    partitions: &[Partition],
+    requested: Option<usize>,
+    on_skip: impl Fn(&Partition),
+    mut visit: impl FnMut(&Partition, FileSystemKind, &DynFs) -> Result<()>,
+) -> Result<()> {
+    for partition in select_partitions(partitions, requested)? {
+        match try_open_partition_filesystem(factory, partition)? {
+            Some((kind, filesystem)) => visit(partition, kind, &filesystem)?,
+            None => {
+                if requested.is_some() {
+                    bail!("p{} has an unsupported filesystem", partition.number);
+                }
+                on_skip(partition);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn command_info(image: &Path, format: OutputFormat) -> Result<()> {
     let (factory, partitions, virtual_size) = image_layout(image)?;
     let host_size = std::fs::metadata(factory.path())?.len();
@@ -277,66 +305,65 @@ fn command_tree(
 ) -> Result<()> {
     let (factory, partitions, _virtual_size) = image_layout(image)?;
     let mut reports = Vec::new();
-    for partition in select_partitions(&partitions, requested)? {
-        let detected = detect_partition_filesystem(&factory, partition)?;
-        if detected == FileSystemKind::Unknown {
-            if requested.is_some() {
-                bail!("p{} has an unsupported filesystem", partition.number);
-            }
+    for_each_readable_partition(
+        &factory,
+        &partitions,
+        requested,
+        |partition| {
             if format == OutputFormat::Text {
                 eprintln!(
                     "warning: skipping p{} (unsupported filesystem)",
                     partition.number
                 );
             }
-            continue;
-        }
-        let (kind, filesystem) = open_partition_filesystem(&factory, partition)?;
-
-        match format {
-            OutputFormat::Text => {
-                println!(
-                    "[p{}] {} {}",
-                    partition.number,
-                    kind,
-                    partition.name.as_deref().unwrap_or("")
-                );
-                walk_filesystem(filesystem.as_ref(), max_depth, |entry| {
-                    let mut prefix = String::new();
-                    for ancestor_is_last in &entry.ancestor_is_last {
-                        prefix.push_str(if *ancestor_is_last { "    " } else { "│   " });
-                    }
-                    prefix.push_str(if entry.is_last {
-                        "└── "
-                    } else {
-                        "├── "
+        },
+        |partition, kind, filesystem| {
+            match format {
+                OutputFormat::Text => {
+                    println!(
+                        "[p{}] {} {}",
+                        partition.number,
+                        kind,
+                        partition.name.as_deref().unwrap_or("")
+                    );
+                    walk_filesystem(filesystem.as_ref(), max_depth, |entry| {
+                        let mut prefix = String::new();
+                        for ancestor_is_last in &entry.ancestor_is_last {
+                            prefix.push_str(if *ancestor_is_last { "    " } else { "│   " });
+                        }
+                        prefix.push_str(if entry.is_last {
+                            "└── "
+                        } else {
+                            "├── "
+                        });
+                        let suffix = if entry.kind == NodeKind::Dir { "/" } else { "" };
+                        println!("{prefix}{}{suffix}", entry.name);
+                        Ok(())
+                    })?;
+                }
+                OutputFormat::Json => {
+                    let mut entries = Vec::new();
+                    walk_filesystem(filesystem.as_ref(), max_depth, |entry| {
+                        entries.push(TreeNode {
+                            path: entry.path.clone(),
+                            name: entry.name.clone(),
+                            kind: node_kind_str(entry.kind).to_string(),
+                            size: entry.size,
+                            depth: entry.depth,
+                        });
+                        Ok(())
+                    })?;
+                    reports.push(TreeReport {
+                        partition: partition.number,
+                        filesystem: kind.to_string(),
+                        name: partition.name.clone(),
+                        entries,
                     });
-                    let suffix = if entry.kind == NodeKind::Dir { "/" } else { "" };
-                    println!("{prefix}{}{suffix}", entry.name);
-                    Ok(())
-                })?;
+                }
             }
-            OutputFormat::Json => {
-                let mut entries = Vec::new();
-                walk_filesystem(filesystem.as_ref(), max_depth, |entry| {
-                    entries.push(TreeNode {
-                        path: entry.path.clone(),
-                        name: entry.name.clone(),
-                        kind: node_kind_str(entry.kind).to_string(),
-                        size: entry.size,
-                        depth: entry.depth,
-                    });
-                    Ok(())
-                })?;
-                reports.push(TreeReport {
-                    partition: partition.number,
-                    filesystem: kind.to_string(),
-                    name: partition.name.clone(),
-                    entries,
-                });
-            }
-        }
-    }
+            Ok(())
+        },
+    )?;
     if format == OutputFormat::Json {
         print_json(&reports)?;
     }
@@ -356,27 +383,25 @@ fn command_find(
         .with_context(|| format!("invalid regular expression: '{pattern}'"))?;
     let (factory, partitions, _virtual_size) = image_layout(image)?;
     let mut matches = Vec::new();
-    for partition in select_partitions(&partitions, requested)? {
-        let detected = detect_partition_filesystem(&factory, partition)?;
-        if detected == FileSystemKind::Unknown {
-            if requested.is_some() {
-                bail!("p{} has an unsupported filesystem", partition.number);
-            }
-            continue;
-        }
-        let (_kind, filesystem) = open_partition_filesystem(&factory, partition)?;
-        walk_filesystem(filesystem.as_ref(), None, |entry| {
-            if expression.is_match(&entry.path) {
-                matches.push(FindMatch {
-                    partition: partition.number,
-                    kind: node_kind_str(entry.kind).to_string(),
-                    size: entry.size,
-                    path: entry.path.clone(),
-                });
-            }
-            Ok(())
-        })?;
-    }
+    for_each_readable_partition(
+        &factory,
+        &partitions,
+        requested,
+        |_partition| {},
+        |partition, _kind, filesystem| {
+            walk_filesystem(filesystem.as_ref(), None, |entry| {
+                if expression.is_match(&entry.path) {
+                    matches.push(FindMatch {
+                        partition: partition.number,
+                        kind: node_kind_str(entry.kind).to_string(),
+                        size: entry.size,
+                        path: entry.path.clone(),
+                    });
+                }
+                Ok(())
+            })
+        },
+    )?;
 
     match format {
         OutputFormat::Json => print_json(&matches),
@@ -403,18 +428,18 @@ fn command_stat(
 ) -> Result<()> {
     let (factory, partitions, _virtual_size) = image_layout(image)?;
     let mut found = Vec::new();
-    for partition in select_partitions(&partitions, requested)? {
-        if detect_partition_filesystem(&factory, partition)? == FileSystemKind::Unknown {
-            if requested.is_some() {
-                bail!("p{} has an unsupported filesystem", partition.number);
+    for_each_readable_partition(
+        &factory,
+        &partitions,
+        requested,
+        |_partition| {},
+        |partition, _kind, filesystem| {
+            if let Some((_id, meta)) = try_resolve_path(filesystem.as_ref(), internal_path)? {
+                found.push((partition.number, meta));
             }
-            continue;
-        }
-        let (_kind, filesystem) = open_partition_filesystem(&factory, partition)?;
-        if let Some((_id, meta)) = try_resolve_path(filesystem.as_ref(), internal_path)? {
-            found.push((partition.number, meta));
-        }
-    }
+            Ok(())
+        },
+    )?;
     if found.is_empty() {
         bail!("path not found in readable partitions: '{internal_path}'");
     }
@@ -476,20 +501,18 @@ fn command_timeline(
 ) -> Result<()> {
     let (factory, partitions, _virtual_size) = image_layout(image)?;
     let mut rows = Vec::new();
-    for partition in select_partitions(&partitions, requested)? {
-        let detected = detect_partition_filesystem(&factory, partition)?;
-        if detected == FileSystemKind::Unknown {
-            if requested.is_some() {
-                bail!("p{} has an unsupported filesystem", partition.number);
-            }
-            continue;
-        }
-        let (_kind, filesystem) = open_partition_filesystem(&factory, partition)?;
-        walk_filesystem(filesystem.as_ref(), None, |entry| {
-            rows.push((partition.number, entry.clone()));
-            Ok(())
-        })?;
-    }
+    for_each_readable_partition(
+        &factory,
+        &partitions,
+        requested,
+        |_partition| {},
+        |partition, _kind, filesystem| {
+            walk_filesystem(filesystem.as_ref(), None, |entry| {
+                rows.push((partition.number, entry.clone()));
+                Ok(())
+            })
+        },
+    )?;
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -558,19 +581,18 @@ fn command_timeline(
 fn command_deleted(image: &Path, requested: Option<usize>, format: OutputFormat) -> Result<()> {
     let (factory, partitions, _virtual_size) = image_layout(image)?;
     let mut rows = Vec::new();
-    for partition in select_partitions(&partitions, requested)? {
-        let detected = detect_partition_filesystem(&factory, partition)?;
-        if detected == FileSystemKind::Unknown {
-            if requested.is_some() {
-                bail!("p{} has an unsupported filesystem", partition.number);
+    for_each_readable_partition(
+        &factory,
+        &partitions,
+        requested,
+        |_partition| {},
+        |partition, _kind, filesystem| {
+            for entry in list_deleted(filesystem.as_ref())? {
+                rows.push(deleted_row(partition.number, entry));
             }
-            continue;
-        }
-        let (_kind, filesystem) = open_partition_filesystem(&factory, partition)?;
-        for entry in list_deleted(filesystem.as_ref())? {
-            rows.push(deleted_row(partition.number, entry));
-        }
-    }
+            Ok(())
+        },
+    )?;
 
     match format {
         OutputFormat::Json => print_json(&rows),
@@ -626,15 +648,18 @@ fn command_extract(
     }
     let (factory, partitions, _virtual_size) = image_layout(image)?;
     let mut found = Vec::new();
-    for partition in select_partitions(&partitions, requested)? {
-        if detect_partition_filesystem(&factory, partition)? == FileSystemKind::Unknown {
-            continue;
-        }
-        let (kind, filesystem) = open_partition_filesystem(&factory, partition)?;
-        if let Some((id, meta)) = try_resolve_path(filesystem.as_ref(), internal_path)? {
-            found.push((partition.clone(), kind, filesystem, id, meta));
-        }
-    }
+    for_each_readable_partition(
+        &factory,
+        &partitions,
+        requested,
+        |_partition| {},
+        |partition, kind, filesystem| {
+            if let Some((id, meta)) = try_resolve_path(filesystem.as_ref(), internal_path)? {
+                found.push((partition.clone(), kind, filesystem.clone(), id, meta));
+            }
+            Ok(())
+        },
+    )?;
     if found.is_empty() {
         bail!("path not found in readable partitions: '{internal_path}'");
     }
