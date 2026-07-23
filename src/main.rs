@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use forensic_image_cli::image::ImageFactory;
+use forensic_image_cli::partition::read_partitions;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -70,8 +72,44 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    anyhow::bail!(
-        "{:?} is scaffolded but not implemented yet; follow repository progress",
-        cli.command
-    )
+    match cli.command {
+        Command::Info { image } => {
+            let factory = ImageFactory::detect(&image)?;
+            let mut opened = factory.open()?;
+            let host_size = std::fs::metadata(factory.path())?.len();
+            let partitions = read_partitions(&mut opened.reader, opened.virtual_size)?;
+            println!("Path: {}", factory.path().display());
+            println!("Container: {}", opened.kind);
+            println!("Host size: {host_size} bytes");
+            println!("Virtual size: {} bytes", opened.virtual_size);
+            println!(
+                "Partition scheme: {}",
+                partitions
+                    .first()
+                    .map(|partition| partition.scheme.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+            println!("Partitions: {}", partitions.len());
+            Ok(())
+        }
+        Command::Partitions { image } => {
+            let factory = ImageFactory::detect(&image)?;
+            let mut opened = factory.open()?;
+            for partition in read_partitions(&mut opened.reader, opened.virtual_size)? {
+                println!(
+                    "p{}\t{}\tstart={}\tsectors={}\toffset={}\tbytes={}\ttype={}\t{}",
+                    partition.number,
+                    partition.scheme,
+                    partition.start_lba,
+                    partition.sectors,
+                    partition.byte_offset(),
+                    partition.byte_len(),
+                    partition.type_id,
+                    partition.name.as_deref().unwrap_or("-")
+                );
+            }
+            Ok(())
+        }
+        command => anyhow::bail!("{command:?} is not implemented yet"),
+    }
 }
