@@ -1,6 +1,6 @@
 [package]
 name = "forensic-image-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Cross-platform, read-only CLI for browsing and extracting files from forensic disk images"
