@@ -1,0 +1,32 @@
+[package]
+name = "forensic-image-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Cross-platform, read-only CLI for browsing and extracting files from forensic disk images"
+license = "MIT"
+
+[[bin]]
+name = "fimg"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+ewf = "0.2.3"
+ext4fs-core = { version = "0.2.6", default-features = false, features = ["vfs"] }
+forensic-vfs = "0.7.0"
+iso9660-forensic = { version = "0.7.5", features = ["vfs"] }
+ntfs-core = { version = "0.9.6", features = ["vfs"] }
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+vmdk = { package = "vmdk-core", version = "0.8.0" }
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[profile.release]
+lto = "thin"
+strip = true
