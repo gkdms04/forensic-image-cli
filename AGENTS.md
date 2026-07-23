@@ -103,11 +103,14 @@ These are product guarantees, not style preferences — do not relax them:
 - Errors are `anyhow` with `.context()`/`with_context()` naming the image,
   partition (`p{n}`), or path involved; user-facing failures use `bail!`.
 
-## codex-skill/
+## skills/
 
-`codex-skill/inspect-disk-image/` packages the CLI as an OpenAI Codex skill.
-`scripts/fimg.py` locates `fimg` via `$FIMG_BIN`, `PATH`, then the per-user
-install dir, and `--install` downloads the latest GitHub release asset. The
-`REPOSITORY` constant and the asset names must stay in sync with
-`.github/workflows/release.yml`. `SKILL.md` encodes the evidence-handling rules
-above for the agent; update it whenever CLI flags or guarantees change.
+`skills/inspect-disk-image/` packages the CLI as an agent skill. It sits at the
+standard `skills/<name>/SKILL.md` catalog path so the skills.sh CLI (`npx skills
+add gkdms04/forensic-image-cli`) and Codex both discover it; `agents/openai.yaml`
+carries the Codex-specific interface metadata. `scripts/fimg.py` locates `fimg`
+via `$FIMG_BIN`, `PATH`, then the per-user install dir, and `--install`
+downloads the latest GitHub release asset. The `REPOSITORY` constant and the
+asset names must stay in sync with `.github/workflows/release.yml`. `SKILL.md`
+encodes the evidence-handling rules above for the agent; update it whenever CLI
+flags or guarantees change.

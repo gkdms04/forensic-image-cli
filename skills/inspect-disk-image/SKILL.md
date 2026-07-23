@@ -1,6 +1,7 @@
 ---
 name: inspect-disk-image
-description: Inspect forensic disk images without mounting or modifying them. Use for E01/EWF segment sets, VMDK, RAW/DD/IMG, MBR, or GPT images when Codex needs to show partitions, list or regex-search internal paths, or extract one requested file from NTFS, ext2/3/4, or ISO 9660.
+description: Inspect forensic disk images without mounting or modifying them. Use for E01/EWF segment sets, VMDK, RAW/DD/IMG, MBR, or GPT images when the agent needs to show partitions, list or regex-search internal paths, or extract one requested file from NTFS, ext2/3/4, or ISO 9660.
+license: MIT
 ---
 
 # Inspect Disk Image

@@ -30,6 +30,19 @@ Download the native binary for your platform from GitHub Releases:
 The binary is self-contained. It does not require WSL, Python, Sleuth Kit,
 qemu-img, Dokan, FUSE, or a filesystem mount.
 
+## Agent skill
+
+`fimg` is also packaged as an agent skill (`inspect-disk-image`) for use with
+Claude Code, Codex, Cursor, and other agents. Install it with the
+[skills.sh](https://skills.sh) CLI:
+
+```console
+npx skills add gkdms04/forensic-image-cli
+```
+
+The skill's launcher fetches the native binary from GitHub Releases on first
+use, so no Rust toolchain is required.
+
 ## CLI
 
 ```console
