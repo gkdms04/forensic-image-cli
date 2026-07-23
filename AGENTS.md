@@ -110,7 +110,9 @@ standard `skills/<name>/SKILL.md` catalog path so the skills.sh CLI (`npx skills
 add gkdms04/forensic-image-cli`) and Codex both discover it; `agents/openai.yaml`
 carries the Codex-specific interface metadata. `scripts/fimg.py` locates `fimg`
 via `$FIMG_BIN`, `PATH`, then the per-user install dir, and `--install`
-downloads the latest GitHub release asset. The `REPOSITORY` constant and the
-asset names must stay in sync with `.github/workflows/release.yml`. `SKILL.md`
-encodes the evidence-handling rules above for the agent; update it whenever CLI
-flags or guarantees change.
+downloads the latest GitHub release asset **and verifies it against the release
+`SHA256SUMS` before installing** — never relax that check. The `REPOSITORY`
+constant, the per-platform asset names in `asset_name()`, and the release matrix
+in `.github/workflows/release.yml` must stay in sync (Windows x86-64, Linux
+x86-64/arm64, macOS x86-64/arm64). `SKILL.md` encodes the evidence-handling
+rules above for the agent; update it whenever CLI flags or guarantees change.

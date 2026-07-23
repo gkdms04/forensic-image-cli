@@ -17,21 +17,34 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
             artifact: fimg-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: fimg-linux-aarch64
           - os: windows-latest
+            target: x86_64-pc-windows-msvc
             artifact: fimg-windows-x86_64.exe
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: fimg-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: fimg-macos-aarch64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - run: cargo test --all-targets
-      - run: cargo build --release
-      - name: Prepare Linux artifact
-        if: runner.os == 'Linux'
-        run: cp target/release/fimg "${{ matrix.artifact }}"
-      - name: Prepare Windows artifact
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Prepare artifact (Unix)
+        if: runner.os != 'Windows'
+        run: cp "target/${{ matrix.target }}/release/fimg" "${{ matrix.artifact }}"
+      - name: Prepare artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Copy-Item target/release/fimg.exe "${{ matrix.artifact }}"
+        run: Copy-Item "target/${{ matrix.target }}/release/fimg.exe" "${{ matrix.artifact }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -47,8 +60,10 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: Generate SHA256SUMS
+        working-directory: artifacts
+        run: sha256sum * > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: artifacts/*
-
