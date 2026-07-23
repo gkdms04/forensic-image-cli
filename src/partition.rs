@@ -139,7 +139,7 @@ fn read_gpt<R: Read + Seek>(
     if entry_count > MAX_GPT_ENTRIES {
         bail!("GPT entry count {entry_count} exceeds safety limit {MAX_GPT_ENTRIES}");
     }
-    if !(128..=MAX_GPT_ENTRY_SIZE).contains(&entry_size) || entry_size % 8 != 0 {
+    if !(128..=MAX_GPT_ENTRY_SIZE).contains(&entry_size) || !entry_size.is_multiple_of(8) {
         bail!("invalid GPT entry size: {entry_size}");
     }
 
