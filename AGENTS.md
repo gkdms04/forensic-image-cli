@@ -40,8 +40,9 @@ FIMG_TEST_IMAGE=/tmp/fimg.raw FIMG_TEST_PATH=/docs/README.md \
 ```
 
 The `image-formats` CI job builds an ext4 fixture, converts it to VMDK
-(`qemu-img`) and E01 (`ewfacquire`), and also builds FAT32, exFAT, and NTFS (with
-a deleted file) fixtures. It runs `tree`/`find`/`stat`/`timeline`/`info
+(`qemu-img`) and E01 (`ewfacquire`), and also builds FAT32 and NTFS (with a
+deleted file) fixtures, plus a best-effort exFAT fixture (skipped when the runner
+kernel lacks exFAT). It runs `tree`/`find`/`stat`/`timeline`/`info
 --json`/`extract` against every container and filesystem, plus `deleted` against
 the NTFS image. Reproduce that loop locally when touching container or filesystem
 code — it is the only end-to-end coverage.
