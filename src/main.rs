@@ -1,11 +1,12 @@
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use forensic_image_cli::filesystem::{
     DeletedEntry, FileSystemKind, copy_file, detect_partition_filesystem, list_deleted,
-    open_partition_filesystem, try_resolve_path, walk_filesystem,
+    try_open_partition_filesystem, try_resolve_path, walk_filesystem,
 };
 use forensic_image_cli::image::ImageFactory;
 use forensic_image_cli::output::{
@@ -14,7 +15,7 @@ use forensic_image_cli::output::{
     node_kind_str, print_json, ts_unix_secs,
 };
 use forensic_image_cli::partition::{Partition, read_partitions};
-use forensic_vfs::NodeKind;
+use forensic_vfs::{DynFs, NodeKind};
 use regex::RegexBuilder;
 
 #[derive(Debug, Parser)]
@@ -29,6 +30,9 @@ struct Cli {
     /// Emit machine-readable JSON instead of text.
     #[arg(long, global = true)]
     json: bool,
+    /// Print a scan progress heartbeat to stderr (full-walk commands only).
+    #[arg(long, global = true)]
+    progress: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -117,6 +121,7 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let format = OutputFormat::from_json_flag(cli.json);
+    let progress = cli.progress;
     match cli.command {
         Command::Info { image } => command_info(&image, format),
         Command::Partitions { image } => command_partitions(&image, format),
@@ -124,13 +129,13 @@ fn main() -> Result<()> {
             image,
             partition,
             max_depth,
-        } => command_tree(&image, partition, max_depth, format),
+        } => command_tree(&image, partition, max_depth, progress, format),
         Command::Find {
             image,
             pattern,
             partition,
             ignore_case,
-        } => command_find(&image, &pattern, partition, ignore_case, format),
+        } => command_find(&image, &pattern, partition, ignore_case, progress, format),
         Command::Stat {
             image,
             path,
@@ -140,8 +145,10 @@ fn main() -> Result<()> {
             image,
             partition,
             bodyfile,
-        } => command_timeline(&image, partition, bodyfile, format),
-        Command::Deleted { image, partition } => command_deleted(&image, partition, format),
+        } => command_timeline(&image, partition, bodyfile, progress, format),
+        Command::Deleted { image, partition } => {
+            command_deleted(&image, partition, progress, format)
+        }
         Command::Extract {
             image,
             path,
@@ -181,6 +188,103 @@ fn select_partitions(
         }
         None => Ok(partitions.iter().collect()),
     }
+}
+
+/// Opt-in scan heartbeat on stderr for the full-filesystem-walk commands.
+///
+/// `tree`, `find`, `timeline`, and `deleted` buffer their results and can run
+/// for minutes on a large E01 with no output at all; `--progress` emits a
+/// throttled entry count so the operator knows the scan is alive. It writes only
+/// to stderr, leaving stdout data (tree/CSV/JSON) untouched: when stderr is a
+/// terminal it repaints one line in place with a carriage return, otherwise it
+/// emits plain lines suitable for a redirected log. Repaints are throttled to at
+/// most one every 200 ms; `finish` prints the final total.
+struct Progress {
+    enabled: bool,
+    tty: bool,
+    count: u64,
+    partition: usize,
+    last: Instant,
+}
+
+impl Progress {
+    fn new(enabled: bool) -> Self {
+        Progress {
+            enabled,
+            tty: std::io::stderr().is_terminal(),
+            count: 0,
+            partition: 0,
+            last: Instant::now(),
+        }
+    }
+
+    /// Count one visited entry, repainting at most every 200 ms.
+    fn tick(&mut self, partition: usize) {
+        if !self.enabled {
+            return;
+        }
+        self.count += 1;
+        self.partition = partition;
+        let now = Instant::now();
+        if now.duration_since(self.last) >= Duration::from_millis(200) {
+            self.last = now;
+            self.emit(false);
+        }
+    }
+
+    fn message(&self) -> String {
+        format!("scanning p{}: {} entries", self.partition, self.count)
+    }
+
+    fn emit(&self, final_line: bool) {
+        let mut stderr = std::io::stderr().lock();
+        if self.tty {
+            // Repaint in place; pad to overwrite a previously longer line.
+            let _ = write!(stderr, "\r{:<60}", self.message());
+            if final_line {
+                let _ = writeln!(stderr);
+            }
+        } else {
+            let _ = writeln!(stderr, "{}", self.message());
+        }
+        let _ = stderr.flush();
+    }
+
+    /// Emit the final total and terminate the progress line.
+    fn finish(&self) {
+        if !self.enabled || self.count == 0 {
+            return;
+        }
+        self.emit(true);
+    }
+}
+
+/// Walk the selected partitions, opening each supported filesystem exactly once.
+///
+/// Centralizes the multi-partition invariant: an unsupported filesystem is a
+/// hard error when the user named a single partition (`requested.is_some()`) and
+/// is otherwise skipped, with `on_skip` invoked so callers can warn. Opening
+/// once (via `try_open_partition_filesystem`) replaces the former detect-then-open
+/// pair, halving container opens on the reopen-per-operation path.
+fn for_each_readable_partition(
+    factory: &ImageFactory,
+    partitions: &[Partition],
+    requested: Option<usize>,
+    on_skip: impl Fn(&Partition),
+    mut visit: impl FnMut(&Partition, FileSystemKind, &DynFs) -> Result<()>,
+) -> Result<()> {
+    for partition in select_partitions(partitions, requested)? {
+        match try_open_partition_filesystem(factory, partition)? {
+            Some((kind, filesystem)) => visit(partition, kind, &filesystem)?,
+            None => {
+                if requested.is_some() {
+                    bail!("p{} has an unsupported filesystem", partition.number);
+                }
+                on_skip(partition);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn command_info(image: &Path, format: OutputFormat) -> Result<()> {
@@ -273,70 +377,74 @@ fn command_tree(
     image: &Path,
     requested: Option<usize>,
     max_depth: Option<usize>,
+    show_progress: bool,
     format: OutputFormat,
 ) -> Result<()> {
     let (factory, partitions, _virtual_size) = image_layout(image)?;
     let mut reports = Vec::new();
-    for partition in select_partitions(&partitions, requested)? {
-        let detected = detect_partition_filesystem(&factory, partition)?;
-        if detected == FileSystemKind::Unknown {
-            if requested.is_some() {
-                bail!("p{} has an unsupported filesystem", partition.number);
-            }
+    let mut progress = Progress::new(show_progress);
+    for_each_readable_partition(
+        &factory,
+        &partitions,
+        requested,
+        |partition| {
             if format == OutputFormat::Text {
                 eprintln!(
                     "warning: skipping p{} (unsupported filesystem)",
                     partition.number
                 );
             }
-            continue;
-        }
-        let (kind, filesystem) = open_partition_filesystem(&factory, partition)?;
-
-        match format {
-            OutputFormat::Text => {
-                println!(
-                    "[p{}] {} {}",
-                    partition.number,
-                    kind,
-                    partition.name.as_deref().unwrap_or("")
-                );
-                walk_filesystem(filesystem.as_ref(), max_depth, |entry| {
-                    let mut prefix = String::new();
-                    for ancestor_is_last in &entry.ancestor_is_last {
-                        prefix.push_str(if *ancestor_is_last { "    " } else { "│   " });
-                    }
-                    prefix.push_str(if entry.is_last {
-                        "└── "
-                    } else {
-                        "├── "
+        },
+        |partition, kind, filesystem| {
+            match format {
+                OutputFormat::Text => {
+                    println!(
+                        "[p{}] {} {}",
+                        partition.number,
+                        kind,
+                        partition.name.as_deref().unwrap_or("")
+                    );
+                    walk_filesystem(filesystem.as_ref(), max_depth, |entry| {
+                        progress.tick(partition.number);
+                        let mut prefix = String::new();
+                        for ancestor_is_last in &entry.ancestor_is_last {
+                            prefix.push_str(if *ancestor_is_last { "    " } else { "│   " });
+                        }
+                        prefix.push_str(if entry.is_last {
+                            "└── "
+                        } else {
+                            "├── "
+                        });
+                        let suffix = if entry.kind == NodeKind::Dir { "/" } else { "" };
+                        println!("{prefix}{}{suffix}", entry.name);
+                        Ok(())
+                    })?;
+                }
+                OutputFormat::Json => {
+                    let mut entries = Vec::new();
+                    walk_filesystem(filesystem.as_ref(), max_depth, |entry| {
+                        progress.tick(partition.number);
+                        entries.push(TreeNode {
+                            path: entry.path.clone(),
+                            name: entry.name.clone(),
+                            kind: node_kind_str(entry.kind).to_string(),
+                            size: entry.size,
+                            depth: entry.depth,
+                        });
+                        Ok(())
+                    })?;
+                    reports.push(TreeReport {
+                        partition: partition.number,
+                        filesystem: kind.to_string(),
+                        name: partition.name.clone(),
+                        entries,
                     });
-                    let suffix = if entry.kind == NodeKind::Dir { "/" } else { "" };
-                    println!("{prefix}{}{suffix}", entry.name);
-                    Ok(())
-                })?;
+                }
             }
-            OutputFormat::Json => {
-                let mut entries = Vec::new();
-                walk_filesystem(filesystem.as_ref(), max_depth, |entry| {
-                    entries.push(TreeNode {
-                        path: entry.path.clone(),
-                        name: entry.name.clone(),
-                        kind: node_kind_str(entry.kind).to_string(),
-                        size: entry.size,
-                        depth: entry.depth,
-                    });
-                    Ok(())
-                })?;
-                reports.push(TreeReport {
-                    partition: partition.number,
-                    filesystem: kind.to_string(),
-                    name: partition.name.clone(),
-                    entries,
-                });
-            }
-        }
-    }
+            Ok(())
+        },
+    )?;
+    progress.finish();
     if format == OutputFormat::Json {
         print_json(&reports)?;
     }
@@ -348,6 +456,7 @@ fn command_find(
     pattern: &str,
     requested: Option<usize>,
     ignore_case: bool,
+    show_progress: bool,
     format: OutputFormat,
 ) -> Result<()> {
     let expression = RegexBuilder::new(pattern)
@@ -356,27 +465,28 @@ fn command_find(
         .with_context(|| format!("invalid regular expression: '{pattern}'"))?;
     let (factory, partitions, _virtual_size) = image_layout(image)?;
     let mut matches = Vec::new();
-    for partition in select_partitions(&partitions, requested)? {
-        let detected = detect_partition_filesystem(&factory, partition)?;
-        if detected == FileSystemKind::Unknown {
-            if requested.is_some() {
-                bail!("p{} has an unsupported filesystem", partition.number);
-            }
-            continue;
-        }
-        let (_kind, filesystem) = open_partition_filesystem(&factory, partition)?;
-        walk_filesystem(filesystem.as_ref(), None, |entry| {
-            if expression.is_match(&entry.path) {
-                matches.push(FindMatch {
-                    partition: partition.number,
-                    kind: node_kind_str(entry.kind).to_string(),
-                    size: entry.size,
-                    path: entry.path.clone(),
-                });
-            }
-            Ok(())
-        })?;
-    }
+    let mut progress = Progress::new(show_progress);
+    for_each_readable_partition(
+        &factory,
+        &partitions,
+        requested,
+        |_partition| {},
+        |partition, _kind, filesystem| {
+            walk_filesystem(filesystem.as_ref(), None, |entry| {
+                progress.tick(partition.number);
+                if expression.is_match(&entry.path) {
+                    matches.push(FindMatch {
+                        partition: partition.number,
+                        kind: node_kind_str(entry.kind).to_string(),
+                        size: entry.size,
+                        path: entry.path.clone(),
+                    });
+                }
+                Ok(())
+            })
+        },
+    )?;
+    progress.finish();
 
     match format {
         OutputFormat::Json => print_json(&matches),
@@ -403,18 +513,18 @@ fn command_stat(
 ) -> Result<()> {
     let (factory, partitions, _virtual_size) = image_layout(image)?;
     let mut found = Vec::new();
-    for partition in select_partitions(&partitions, requested)? {
-        if detect_partition_filesystem(&factory, partition)? == FileSystemKind::Unknown {
-            if requested.is_some() {
-                bail!("p{} has an unsupported filesystem", partition.number);
+    for_each_readable_partition(
+        &factory,
+        &partitions,
+        requested,
+        |_partition| {},
+        |partition, _kind, filesystem| {
+            if let Some((_id, meta)) = try_resolve_path(filesystem.as_ref(), internal_path)? {
+                found.push((partition.number, meta));
             }
-            continue;
-        }
-        let (_kind, filesystem) = open_partition_filesystem(&factory, partition)?;
-        if let Some((_id, meta)) = try_resolve_path(filesystem.as_ref(), internal_path)? {
-            found.push((partition.number, meta));
-        }
-    }
+            Ok(())
+        },
+    )?;
     if found.is_empty() {
         bail!("path not found in readable partitions: '{internal_path}'");
     }
@@ -472,24 +582,26 @@ fn command_timeline(
     image: &Path,
     requested: Option<usize>,
     bodyfile: bool,
+    show_progress: bool,
     format: OutputFormat,
 ) -> Result<()> {
     let (factory, partitions, _virtual_size) = image_layout(image)?;
     let mut rows = Vec::new();
-    for partition in select_partitions(&partitions, requested)? {
-        let detected = detect_partition_filesystem(&factory, partition)?;
-        if detected == FileSystemKind::Unknown {
-            if requested.is_some() {
-                bail!("p{} has an unsupported filesystem", partition.number);
-            }
-            continue;
-        }
-        let (_kind, filesystem) = open_partition_filesystem(&factory, partition)?;
-        walk_filesystem(filesystem.as_ref(), None, |entry| {
-            rows.push((partition.number, entry.clone()));
-            Ok(())
-        })?;
-    }
+    let mut progress = Progress::new(show_progress);
+    for_each_readable_partition(
+        &factory,
+        &partitions,
+        requested,
+        |_partition| {},
+        |partition, _kind, filesystem| {
+            walk_filesystem(filesystem.as_ref(), None, |entry| {
+                progress.tick(partition.number);
+                rows.push((partition.number, entry.clone()));
+                Ok(())
+            })
+        },
+    )?;
+    progress.finish();
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -517,7 +629,7 @@ fn command_timeline(
                 writeln!(
                     out,
                     "0|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-                    entry.path,
+                    bodyfile_name(&entry.path),
                     entry.ino,
                     entry.mode.unwrap_or(0),
                     entry.uid.unwrap_or(0),
@@ -555,22 +667,29 @@ fn command_timeline(
     }
 }
 
-fn command_deleted(image: &Path, requested: Option<usize>, format: OutputFormat) -> Result<()> {
+fn command_deleted(
+    image: &Path,
+    requested: Option<usize>,
+    show_progress: bool,
+    format: OutputFormat,
+) -> Result<()> {
     let (factory, partitions, _virtual_size) = image_layout(image)?;
     let mut rows = Vec::new();
-    for partition in select_partitions(&partitions, requested)? {
-        let detected = detect_partition_filesystem(&factory, partition)?;
-        if detected == FileSystemKind::Unknown {
-            if requested.is_some() {
-                bail!("p{} has an unsupported filesystem", partition.number);
+    let mut progress = Progress::new(show_progress);
+    for_each_readable_partition(
+        &factory,
+        &partitions,
+        requested,
+        |_partition| {},
+        |partition, _kind, filesystem| {
+            for entry in list_deleted(filesystem.as_ref())? {
+                progress.tick(partition.number);
+                rows.push(deleted_row(partition.number, entry));
             }
-            continue;
-        }
-        let (_kind, filesystem) = open_partition_filesystem(&factory, partition)?;
-        for entry in list_deleted(filesystem.as_ref())? {
-            rows.push(deleted_row(partition.number, entry));
-        }
-    }
+            Ok(())
+        },
+    )?;
+    progress.finish();
 
     match format {
         OutputFormat::Json => print_json(&rows),
@@ -626,15 +745,18 @@ fn command_extract(
     }
     let (factory, partitions, _virtual_size) = image_layout(image)?;
     let mut found = Vec::new();
-    for partition in select_partitions(&partitions, requested)? {
-        if detect_partition_filesystem(&factory, partition)? == FileSystemKind::Unknown {
-            continue;
-        }
-        let (kind, filesystem) = open_partition_filesystem(&factory, partition)?;
-        if let Some((id, meta)) = try_resolve_path(filesystem.as_ref(), internal_path)? {
-            found.push((partition.clone(), kind, filesystem, id, meta));
-        }
-    }
+    for_each_readable_partition(
+        &factory,
+        &partitions,
+        requested,
+        |_partition| {},
+        |partition, kind, filesystem| {
+            if let Some((id, meta)) = try_resolve_path(filesystem.as_ref(), internal_path)? {
+                found.push((partition.clone(), kind, filesystem.clone(), id, meta));
+            }
+            Ok(())
+        },
+    )?;
     if found.is_empty() {
         bail!("path not found in readable partitions: '{internal_path}'");
     }
@@ -716,6 +838,88 @@ fn csv_field(value: &str) -> String {
     }
 }
 
+/// Sanitize a path for a Sleuth Kit bodyfile `name` field.
+///
+/// The bodyfile format is `|`-delimited with one record per line and defines no
+/// quoting, so a path containing `|`, CR, or LF would inject an extra field or
+/// terminate the record early and desync downstream `mactime` parsing.
+/// Percent-encode exactly those bytes — plus `%` itself, so the mapping stays
+/// reversible — and pass every other character through unchanged.
+fn bodyfile_name(value: &str) -> String {
+    if !value.contains(['%', '|', '\n', '\r']) {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '|' => out.push_str("%7C"),
+            '\r' => out.push_str("%0D"),
+            '\n' => out.push_str("%0A"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn hex_digest(digest: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Progress, bodyfile_name, csv_field};
+
+    #[test]
+    fn progress_disabled_never_counts() {
+        let mut progress = Progress::new(false);
+        for _ in 0..5 {
+            progress.tick(0);
+        }
+        assert_eq!(progress.count, 0);
+    }
+
+    #[test]
+    fn progress_enabled_counts_and_labels_current_partition() {
+        let mut progress = Progress::new(true);
+        progress.tick(2);
+        progress.tick(2);
+        progress.tick(3);
+        assert_eq!(progress.count, 3);
+        assert_eq!(progress.message(), "scanning p3: 3 entries");
+    }
+
+    #[test]
+    fn bodyfile_name_passes_ordinary_paths_through() {
+        assert_eq!(
+            bodyfile_name("/docs/report final.txt"),
+            "/docs/report final.txt"
+        );
+    }
+
+    #[test]
+    fn bodyfile_name_encodes_delimiter_and_line_breaks() {
+        assert_eq!(bodyfile_name("/tmp/a|b\r\nc"), "/tmp/a%7Cb%0D%0Ac");
+    }
+
+    #[test]
+    fn bodyfile_name_keeps_encoding_reversible_via_percent() {
+        // A literal "%7C" must not be indistinguishable from an encoded '|'.
+        assert_eq!(bodyfile_name("a%7Cb"), "a%257Cb");
+        assert_eq!(bodyfile_name("a|b"), "a%7Cb");
+    }
+
+    #[test]
+    fn encoded_bodyfile_name_stays_a_single_field_on_one_line() {
+        let record = format!("0|{}|1|2|3|4|5|6|7|8|9", bodyfile_name("x|y\nz"));
+        assert_eq!(record.matches('|').count(), 10, "exactly 11 fields");
+        assert_eq!(record.lines().count(), 1, "one record per line");
+    }
+
+    #[test]
+    fn csv_field_quotes_only_when_needed() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("she said \"hi\""), "\"she said \"\"hi\"\"\"");
+    }
 }

@@ -76,10 +76,31 @@ pub fn open_partition_filesystem(
     factory: &ImageFactory,
     partition: &Partition,
 ) -> Result<(FileSystemKind, DynFs)> {
+    match try_open_partition_filesystem(factory, partition)? {
+        Some(result) => Ok(result),
+        None => bail!(
+            "unsupported or unrecognized filesystem in p{} at byte offset {}",
+            partition.number,
+            partition.byte_offset()
+        ),
+    }
+}
+
+/// Open a partition's filesystem, returning `None` when the filesystem is
+/// unrecognized rather than failing. Opens the container exactly once and runs
+/// magic detection exactly once, so callers that would otherwise `detect` and
+/// then `open` do not pay for two container opens per partition.
+pub fn try_open_partition_filesystem(
+    factory: &ImageFactory,
+    partition: &Partition,
+) -> Result<Option<(FileSystemKind, DynFs)>> {
     let opened = factory.open()?;
     let mut reader =
         WindowReader::new(opened.reader, partition.byte_offset(), partition.byte_len());
     let kind = detect_filesystem(&mut reader)?;
+    if kind == FileSystemKind::Unknown {
+        return Ok(None);
+    }
     reader.seek(SeekFrom::Start(0))?;
     let filesystem: DynFs = match kind {
         FileSystemKind::Ntfs => Arc::new(
@@ -98,15 +119,9 @@ pub fn open_partition_filesystem(
             iso9660_forensic::vfs::IsoVfs::open(reader)
                 .with_context(|| format!("cannot open ISO 9660 in p{}", partition.number))?,
         ),
-        FileSystemKind::Unknown => {
-            bail!(
-                "unsupported or unrecognized filesystem in p{} at byte offset {}",
-                partition.number,
-                partition.byte_offset()
-            )
-        }
+        FileSystemKind::Unknown => unreachable!("Unknown handled above"),
     };
-    Ok((kind, filesystem))
+    Ok(Some((kind, filesystem)))
 }
 
 pub fn detect_filesystem<R: Read + Seek>(reader: &mut R) -> Result<FileSystemKind> {
