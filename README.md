@@ -25,7 +25,10 @@ exFAT, FAT, HFS+, and APFS are roadmap formats.
 Download the native binary for your platform from GitHub Releases:
 
 - Windows: `fimg-windows-x86_64.exe`
-- Linux: `fimg-linux-x86_64`
+- Linux: `fimg-linux-x86_64`, `fimg-linux-aarch64`
+- macOS: `fimg-macos-x86_64`, `fimg-macos-aarch64`
+
+Each release also publishes a `SHA256SUMS` file; verify your download against it.
 
 The binary is self-contained. It does not require WSL, Python, Sleuth Kit,
 qemu-img, Dokan, FUSE, or a filesystem mount.
@@ -41,7 +44,9 @@ npx skills add gkdms04/forensic-image-cli
 ```
 
 The skill's launcher fetches the native binary from GitHub Releases on first
-use, so no Rust toolchain is required.
+use, verifies it against the release `SHA256SUMS`, and caches it locally, so no
+Rust toolchain is required. Prebuilt binaries cover Windows x86-64, Linux
+x86-64/arm64, and macOS x86-64/arm64.
 
 ## CLI
 

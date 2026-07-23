@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
@@ -15,6 +16,27 @@ from pathlib import Path
 
 
 REPOSITORY = "gkdms04/forensic-image-cli"
+
+
+def asset_name() -> str:
+    system = platform.system()
+    machine = platform.machine().lower()
+    if machine in {"amd64", "x86_64"}:
+        arch = "x86_64"
+    elif machine in {"arm64", "aarch64"}:
+        arch = "aarch64"
+    else:
+        raise RuntimeError(f"No prebuilt release for architecture: {machine}")
+
+    if system == "Windows":
+        if arch != "x86_64":
+            raise RuntimeError(f"No prebuilt Windows release for architecture: {machine}")
+        return "fimg-windows-x86_64.exe"
+    if system == "Linux":
+        return f"fimg-linux-{arch}"
+    if system == "Darwin":
+        return f"fimg-macos-{arch}"
+    raise RuntimeError(f"No prebuilt release for platform: {system}")
 
 
 def install_dir() -> Path:
@@ -38,35 +60,53 @@ def find_binary() -> Path | None:
     return next((path for path in candidates if path and path.is_file()), None)
 
 
+def download_bytes(url: str, timeout: int) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": "fimg-skill"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def expected_digest(sums: str, name: str) -> str:
+    for line in sums.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].lstrip("*") == name:
+            return parts[0].lower()
+    raise RuntimeError(f"No checksum for {name} in SHA256SUMS")
+
+
 def install() -> Path:
-    machine = platform.machine().lower()
-    if machine not in {"amd64", "x86_64"}:
-        raise RuntimeError(f"No prebuilt release for architecture: {machine}")
-    asset_name = "fimg-windows-x86_64.exe" if os.name == "nt" else "fimg-linux-x86_64"
+    wanted = asset_name()
     request = urllib.request.Request(
         f"https://api.github.com/repos/{REPOSITORY}/releases/latest",
         headers={"Accept": "application/vnd.github+json", "User-Agent": "fimg-skill"},
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         release = json.load(response)
-    asset = next((item for item in release.get("assets", []) if item["name"] == asset_name), None)
-    if not asset:
-        raise RuntimeError(f"Release asset not found: {asset_name}")
+    assets = {item["name"]: item["browser_download_url"] for item in release.get("assets", [])}
+    if wanted not in assets:
+        raise RuntimeError(f"Release asset not found: {wanted}")
+    if "SHA256SUMS" not in assets:
+        raise RuntimeError("Release is missing SHA256SUMS; refusing to install unverified binary")
+
+    sums = download_bytes(assets["SHA256SUMS"], timeout=30).decode("utf-8")
+    expected = expected_digest(sums, wanted)
+    payload = download_bytes(assets[wanted], timeout=120)
+    actual = hashlib.sha256(payload).hexdigest()
+    if actual != expected:
+        raise RuntimeError(
+            f"Checksum mismatch for {wanted}: expected {expected}, got {actual}"
+        )
 
     destination = install_dir() / binary_name()
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_suffix(destination.suffix + ".partial")
     try:
-        download = urllib.request.Request(
-            asset["browser_download_url"], headers={"User-Agent": "fimg-skill"}
-        )
-        with urllib.request.urlopen(download, timeout=120) as response, partial.open("wb") as output:
-            shutil.copyfileobj(response, output)
+        partial.write_bytes(payload)
         partial.chmod(partial.stat().st_mode | stat.S_IXUSR)
         partial.replace(destination)
     finally:
         partial.unlink(missing_ok=True)
-    print(f"Installed: {destination}")
+    print(f"Installed: {destination} (sha256 {actual})")
     return destination
 
 
