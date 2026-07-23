@@ -1,9 +1,10 @@
 # forensic-image-cli
 
-`fimg` is a native Windows and Linux, read-only CLI for inspecting forensic
-disk images without mounting them. It is designed for quick terminal workflows:
-show the partition layout, print a file tree, search paths with a regular
-expression, and extract a selected file.
+`fimg` is a native Windows, Linux, and macOS, read-only CLI for inspecting
+forensic disk images without mounting them. It is designed for quick terminal
+workflows: show the partition layout, print a file tree, search paths with a
+regular expression, list deleted files, emit a timeline, and extract a selected
+file. Every command can emit JSON with `--json`.
 
 Input support:
 
@@ -16,9 +17,10 @@ Disk and filesystem support:
 - MBR and GPT partition tables
 - NTFS
 - ext2/ext3/ext4
+- FAT12/16/32 and exFAT
 - ISO 9660
 
-exFAT, FAT, HFS+, and APFS are roadmap formats.
+HFS+ and APFS are roadmap formats.
 
 ## Install
 
@@ -54,15 +56,23 @@ x86-64/arm64, and macOS x86-64/arm64.
 fimg info <IMAGE>
 fimg partitions <IMAGE>
 fimg tree <IMAGE> [--partition N] [--max-depth N]
-fimg find <IMAGE> <PATTERN> [--partition N]
+fimg find <IMAGE> <PATTERN> [--partition N] [--ignore-case]
+fimg stat <IMAGE> <PATH> [--partition N]
+fimg timeline <IMAGE> [--partition N] [--bodyfile]
+fimg deleted <IMAGE> [--partition N]
 fimg extract <IMAGE> <PATH> --output <DEST> [--partition N]
 ```
+
+Any command accepts `--json` for machine-readable output.
 
 Examples:
 
 ```console
 fimg tree evidence.E01 --max-depth 5
 fimg find server.vmdk '(?i)\.(docx|pdf)$'
+fimg stat evidence.E01 /Users/Alice/report.docx --json
+fimg timeline evidence.E01 --bodyfile > bodyfile.txt   # feed Sleuth Kit mactime
+fimg deleted evidence.E01 --partition 2
 fimg extract evidence.E01 /Users/Alice/report.docx \
   --partition 3 --output ./report.docx
 ```
@@ -71,6 +81,11 @@ The source image is always opened read-only. `extract` is the only command that
 writes evidence-derived data, and it refuses to replace an existing destination
 unless `--overwrite` is supplied. Successful extraction prints the output
 SHA-256.
+
+`stat` and `timeline` surface the MAC(B) timestamps preserved by each
+filesystem; a missing time is shown as empty/`null` rather than epoch zero, which
+is forensically distinct. `deleted` recovers deleted and orphaned nodes where the
+filesystem allows (NTFS reports recovered names; ext/FAT expose bare metadata).
 
 ## Build
 
@@ -85,7 +100,8 @@ The resulting executable is `target/release/fimg` (`fimg.exe` on Windows).
 ## Current limits
 
 - Encrypted filesystems and encrypted EWF2 images are rejected.
-- FAT/exFAT, HFS+, APFS, BitLocker, LUKS, deleted-file recovery, and alternate
-  data streams are not implemented yet.
+- HFS+, APFS, BitLocker, LUKS, and alternate data streams are not implemented
+  yet. Deleted-file enumeration depends on the filesystem: NTFS recovers names,
+  ext/FAT surface bare metadata, and ISO 9660 exposes none.
 - Treat this as a triage/extraction helper. Verify important forensic results
   with an independent tool.

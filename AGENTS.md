@@ -39,14 +39,17 @@ FIMG_TEST_IMAGE=/tmp/fimg.raw FIMG_TEST_PATH=/docs/README.md \
   FIMG_TEST_EXPECTED_FILE=README.md cargo test
 ```
 
-The `image-formats` CI job builds the same ext4 fixture, converts it to VMDK
-(`qemu-img`) and E01 (`ewfacquire`), and runs `tree`/`find`/`extract` against
-all three. Reproduce that loop locally when touching container or filesystem
+The `image-formats` CI job builds an ext4 fixture, converts it to VMDK
+(`qemu-img`) and E01 (`ewfacquire`), and also builds FAT32 and NTFS (with a
+deleted file) fixtures, plus a best-effort exFAT fixture (skipped when the runner
+kernel lacks exFAT). It runs `tree`/`find`/`stat`/`timeline`/`info
+--json`/`extract` against every container and filesystem, plus `deleted` against
+the NTFS image. Reproduce that loop locally when touching container or filesystem
 code — it is the only end-to-end coverage.
 
 ## Architecture
 
-Three layers, each in one file under `src/`, composed by `main.rs`:
+Three layers under `src/`, composed by `main.rs`; `output.rs` renders results:
 
 1. **`image.rs` — container layer.** `ImageFactory::detect` sniffs the first 512
    bytes plus the file extension to pick `Raw` / `Ewf` / `Vmdk`, then
@@ -65,16 +68,26 @@ Three layers, each in one file under `src/`, composed by `main.rs`:
 
 3. **`filesystem.rs` — filesystem layer.** `detect_filesystem` reads magics
    directly (NTFS OEM at 0x03, ext superblock magic at 1024+56, ISO 9660 `CD001`
-   at 16*2048+1) rather than trusting the partition type byte.
+   at 16*2048+1, FAT/exFAT via the 0x55AA boot signature plus the exFAT OEM name
+   or FAT type label) rather than trusting the partition type byte.
    `open_partition_filesystem` returns a `forensic_vfs::DynFs` (`Arc<dyn
    FileSystem>`), which is the unifying abstraction: `ntfs_core::NtfsFs`,
-   `ext4fs::Ext4Fs`, and `iso9660_forensic::vfs::IsoVfs` all implement it, so
-   `walk_filesystem`, `try_resolve_path`, and `copy_file` are filesystem-
-   agnostic. Adding a filesystem = add a `FileSystemKind` variant, a magic check,
-   and one `Arc::new(...)` arm.
+   `ext4fs::Ext4Fs`, `fatfs::FatFs`, and `iso9660_forensic::vfs::IsoVfs` all
+   implement it, so `walk_filesystem`, `try_resolve_path`, `copy_file`, and
+   `list_deleted` are filesystem-agnostic. Adding a filesystem = add a
+   `FileSystemKind` variant, a magic check, and one `Arc::new(...)` arm.
 
-Note: the `ext4fs-core` package in `Cargo.toml` is imported as `ext4fs`, and
-`vmdk-core` is aliased to `vmdk`.
+4. **`output.rs` — rendering.** `OutputFormat` (from the global `--json` flag)
+   and the serializable report DTOs. Each `command_*` builds a DTO and branches
+   Text vs `print_json`. Timestamps come from `forensic_vfs::TimeStamp.unix_nanos`
+   (`i128`, no `Display`); `format_ts` renders RFC 3339 UTC via an inline
+   civil-date helper — **no calendar/time dependency**. `None` times stay `null`
+   (not epoch zero). `list_deleted` merges the rich `deleted_nodes()` (NTFS:
+   name + id) and bare `deleted()` (ext/FAT/ISO: `FsMeta`) surfaces, deduped by
+   inode.
+
+Note: `Cargo.toml` aliases `ext4fs-core` → `ext4fs`, `vmdk-core` → `vmdk`, and
+`fat-core` → `fatfs` (its own lib name is the too-generic `fat`).
 
 **Reopen-per-operation:** `detect_partition_filesystem` and
 `open_partition_filesystem` each call `factory.open()` afresh instead of sharing
