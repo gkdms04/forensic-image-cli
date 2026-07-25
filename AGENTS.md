@@ -39,6 +39,22 @@ FIMG_TEST_IMAGE=/tmp/fimg.raw FIMG_TEST_PATH=/docs/README.md \
   FIMG_TEST_EXPECTED_FILE=README.md cargo test
 ```
 
+`filesystem.rs::recovers_deleted_node_from_ntfs_fixture_when_configured` is the
+sibling real-image test for NTFS deleted-node recovery (the `deleted` surface
+that NTFS exposes with names, unlike ext4). It skips unless
+`FIMG_TEST_NTFS_IMAGE` is set. Build a fixture with `ntfs-3g` (mkntfs +
+mount-populate-delete) — needs FUSE:
+
+```sh
+truncate -s 48M /tmp/fimg-ntfs.raw && mkntfs -Q -F -L NTFS_EVIDENCE /tmp/fimg-ntfs.raw
+mkdir -p /tmp/ntfsmnt && ntfs-3g /tmp/fimg-ntfs.raw /tmp/ntfsmnt
+mkdir /tmp/ntfsmnt/docs && echo secret > /tmp/ntfsmnt/docs/secret_evidence.txt
+sync && rm /tmp/ntfsmnt/docs/secret_evidence.txt && sync
+fusermount -u /tmp/ntfsmnt
+FIMG_TEST_NTFS_IMAGE=/tmp/fimg-ntfs.raw \
+  FIMG_TEST_DELETED_NAME=secret_evidence.txt cargo test
+```
+
 The `image-formats` CI job builds an ext4 fixture, converts it to VMDK
 (`qemu-img`) and E01 (`ewfacquire`), and also builds FAT32 and NTFS (with a
 deleted file) fixtures, plus a best-effort exFAT fixture (skipped when the runner

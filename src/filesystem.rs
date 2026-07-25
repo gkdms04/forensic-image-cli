@@ -614,4 +614,38 @@ mod tests {
             assert_eq!(extracted, std::fs::read(expected_file).unwrap());
         }
     }
+
+    #[test]
+    fn recovers_deleted_node_from_ntfs_fixture_when_configured() {
+        use crate::image::ImageFactory;
+        use crate::partition::read_partitions;
+
+        let Some(image) = std::env::var_os("FIMG_TEST_NTFS_IMAGE") else {
+            eprintln!("FIMG_TEST_NTFS_IMAGE is not set; skipping external NTFS fixture");
+            return;
+        };
+        let factory = ImageFactory::detect(image).unwrap();
+        let mut opened = factory.open().unwrap();
+        let partitions = read_partitions(&mut opened.reader, opened.virtual_size).unwrap();
+        let partition = partitions.first().unwrap();
+        let (kind, filesystem) = super::open_partition_filesystem(&factory, partition).unwrap();
+        assert_eq!(kind, super::FileSystemKind::Ntfs);
+
+        let deleted = super::list_deleted(filesystem.as_ref()).unwrap();
+        assert!(
+            !deleted.is_empty(),
+            "expected at least one recoverable deleted node on the NTFS fixture"
+        );
+        // NTFS exposes deleted names; when the fixture's deleted filename is
+        // known, assert it is recovered by name.
+        if let Ok(expected_name) = std::env::var("FIMG_TEST_DELETED_NAME") {
+            assert!(
+                deleted
+                    .iter()
+                    .any(|entry| entry.name.as_deref() == Some(expected_name.as_str())),
+                "deleted node '{expected_name}' was not recovered; got {:?}",
+                deleted.iter().map(|entry| &entry.name).collect::<Vec<_>>()
+            );
+        }
+    }
 }
