@@ -197,8 +197,9 @@ fn le_u64(bytes: &[u8]) -> u64 {
 }
 
 fn decode_utf16_name(bytes: &[u8]) -> Option<String> {
-    let words: Vec<u16> = bytes
-        .chunks_exact(2)
+    let (pairs, _) = bytes.as_chunks::<2>();
+    let words: Vec<u16> = pairs
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .take_while(|word| *word != 0)
         .collect();
