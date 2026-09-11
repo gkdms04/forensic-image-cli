@@ -85,12 +85,22 @@ jobs:
             target/debug/fimg tree "$image" --max-depth 3 | grep "README.md"
             target/debug/fimg find "$image" '(?i)readme[.]md' | grep "/docs/README.md"
             target/debug/fimg stat "$image" /docs/README.md --json | grep '"size"'
+            target/debug/fimg hash "$image" /docs/README.md --json | grep '"md5"'
+            target/debug/fimg hunt "$image" 'forensic-image-cli' --scope files --json | grep '"matches"'
+            target/debug/fimg triage "$image" --no-hash --json | grep '"summary"'
             target/debug/fimg timeline "$image" --bodyfile | grep "/docs/README.md"
             target/debug/fimg extract "$image" /docs/README.md \
               --output /tmp/extracted.md --overwrite
             cmp /tmp/extracted.md README.md
             target/debug/fimg info "$image" --json | grep '"container"'
           done
+          target/debug/fimg carve /tmp/fimg.raw --type elf --json | grep '"candidates"'
+          target/debug/fimg raw-extract /tmp/fimg.raw --offset 0 --length 512 \
+            --output /tmp/boot.bin --overwrite --json | grep '"sha256"'
       - name: Recover the deleted NTFS file
-        run: target/debug/fimg deleted /tmp/ntfs.raw | grep "secret.txt"
-
+        run: |
+          set -euo pipefail
+          target/debug/fimg deleted /tmp/ntfs.raw | grep "secret.txt"
+          target/debug/fimg recover /tmp/ntfs.raw --name secret.txt \
+            --output /tmp/recovered-secret.txt
+          grep -q "deleted-evidence" /tmp/recovered-secret.txt
