@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use forensic_image_cli::digest::{hash_node, hash_reader};
+use forensic_image_cli::carve::scan_signatures;
+use forensic_image_cli::digest::{Hashes, hash_node, hash_reader};
 use forensic_image_cli::filesystem::{
     DeletedEntry, FileSystemKind, copy_file, detect_partition_filesystem, list_deleted,
     try_open_partition_filesystem, try_resolve_path, walk_filesystem,
@@ -21,6 +22,7 @@ use forensic_image_cli::triage::{TriageCollector, TriageImage, TriagePartition, 
 use forensic_vfs::{DynFs, NodeKind};
 use regex::RegexBuilder;
 use regex::bytes::RegexBuilder as BytesRegexBuilder;
+use serde::Serialize;
 
 const DEFAULT_HUNT_PATTERN: &str =
     r"(?i)(?:flag|ctf|dfc|password|secret|recovery[ _-]?key|bitlocker)";
@@ -50,6 +52,16 @@ impl std::fmt::Display for HuntScope {
             Self::All => "all",
         })
     }
+}
+
+#[derive(Debug, Serialize)]
+struct RawExtractReport {
+    image: String,
+    offset: u64,
+    length: u64,
+    output: String,
+    #[serde(flatten)]
+    hashes: Hashes,
 }
 
 #[derive(Debug, Parser)]
@@ -147,6 +159,34 @@ enum Command {
         /// Disable the automatic UTF-16LE pass.
         #[arg(long)]
         no_utf16: bool,
+    },
+    /// Locate common embedded file signatures across decoded media.
+    Carve {
+        /// E01, VMDK, or raw disk image.
+        image: PathBuf,
+        /// Restrict candidates to a type or extension such as png, pdf, zip, or exe.
+        #[arg(long = "type")]
+        type_filter: Option<String>,
+        /// Stop after this many candidates.
+        #[arg(long, default_value_t = 10_000)]
+        max_candidates: usize,
+    },
+    /// Extract an exact byte range from decoded media without mounting it.
+    RawExtract {
+        /// E01, VMDK, or raw disk image.
+        image: PathBuf,
+        /// Virtual-media byte offset, decimal or 0x-prefixed hexadecimal.
+        #[arg(long, value_parser = parse_offset)]
+        offset: u64,
+        /// Number of bytes to extract, decimal or 0x-prefixed hexadecimal.
+        #[arg(long, value_parser = parse_offset)]
+        length: u64,
+        /// Destination path on the host.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Replace an existing output file.
+        #[arg(long)]
+        overwrite: bool,
     },
     /// Show metadata and MAC(B) timestamps for one path.
     Stat {
@@ -275,6 +315,18 @@ fn main() -> Result<()> {
             progress,
             format,
         ),
+        Command::Carve {
+            image,
+            type_filter,
+            max_candidates,
+        } => command_carve(&image, type_filter.as_deref(), max_candidates, format),
+        Command::RawExtract {
+            image,
+            offset,
+            length,
+            output,
+            overwrite,
+        } => command_raw_extract(&image, offset, length, &output, overwrite, format),
         Command::Stat {
             image,
             path,
@@ -614,6 +666,20 @@ fn severity_rank(severity: &str) -> u8 {
         "medium" => 2,
         "low" => 1,
         _ => 0,
+    }
+}
+
+fn parse_offset(value: &str) -> std::result::Result<u64, String> {
+    let value = value.trim();
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).map_err(|error| format!("invalid hexadecimal value: {error}"))
+    } else {
+        value
+            .parse::<u64>()
+            .map_err(|error| format!("invalid decimal value: {error}"))
     }
 }
 
@@ -960,6 +1026,120 @@ fn command_hunt(
                 report.scanned_bytes,
                 if report.truncated { " (truncated)" } else { "" }
             );
+            Ok(())
+        }
+    }
+}
+
+fn command_carve(
+    image: &Path,
+    type_filter: Option<&str>,
+    max_candidates: usize,
+    format: OutputFormat,
+) -> Result<()> {
+    if max_candidates == 0 || max_candidates > 1_000_000 {
+        bail!("--max-candidates must be between 1 and 1000000");
+    }
+    let factory = ImageFactory::detect(image)?;
+    let opened = factory.open()?;
+    let report = scan_signatures(
+        opened.reader,
+        &factory.path().display().to_string(),
+        opened.virtual_size,
+        type_filter,
+        max_candidates,
+    )?;
+    match format {
+        OutputFormat::Json => print_json(&report),
+        OutputFormat::Text => {
+            for candidate in &report.candidates {
+                println!(
+                    "{}\t{}\t.{}\t{}",
+                    candidate.offset,
+                    candidate.kind,
+                    candidate.suggested_extension,
+                    candidate.header_hex
+                );
+            }
+            eprintln!(
+                "carve: {} candidates in {} bytes{}",
+                report.candidates.len(),
+                report.scanned_bytes,
+                if report.truncated { " (truncated)" } else { "" }
+            );
+            Ok(())
+        }
+    }
+}
+
+fn command_raw_extract(
+    image: &Path,
+    offset: u64,
+    length: u64,
+    output: &Path,
+    overwrite: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    if length == 0 {
+        bail!("--length must be greater than zero");
+    }
+    validate_destination(output, overwrite)?;
+    let factory = ImageFactory::detect(image)?;
+    let mut opened = factory.open()?;
+    let end = offset.checked_add(length).context("byte range overflow")?;
+    if end > opened.virtual_size {
+        bail!(
+            "requested range {offset}..{end} exceeds virtual image size {}",
+            opened.virtual_size
+        );
+    }
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    opened
+        .reader
+        .seek(SeekFrom::Start(offset))
+        .context("cannot seek to raw extraction offset")?;
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("cannot create destination directory '{}'", parent.display()))?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).context("cannot create temporary output file")?;
+    let copied = std::io::copy(&mut opened.reader.take(length), temporary.as_file_mut())
+        .context("cannot copy decoded byte range")?;
+    if copied != length {
+        bail!("unexpected end of image after {copied} of {length} requested bytes");
+    }
+    temporary.as_file_mut().flush()?;
+    temporary.as_file_mut().sync_all()?;
+    let (hashed_size, hashes) = hash_reader(temporary.reopen()?)?;
+    if hashed_size != length {
+        bail!("temporary extraction size changed before hashing");
+    }
+    if output.exists() {
+        std::fs::remove_file(output)
+            .with_context(|| format!("cannot replace destination '{}'", output.display()))?;
+    }
+    temporary
+        .persist(output)
+        .map_err(|error| error.error)
+        .with_context(|| format!("cannot finalize destination '{}'", output.display()))?;
+
+    let report = RawExtractReport {
+        image: factory.path().display().to_string(),
+        offset,
+        length,
+        output: output.display().to_string(),
+        hashes,
+    };
+    match format {
+        OutputFormat::Json => print_json(&report),
+        OutputFormat::Text => {
+            println!("Extracted raw range: {}", report.output);
+            println!("Image: {}", report.image);
+            println!("Offset: {} (0x{:x})", report.offset, report.offset);
+            println!("Length: {} bytes", report.length);
+            println!("MD5: {}", report.hashes.md5);
+            println!("SHA-1: {}", report.hashes.sha1);
+            println!("SHA-256: {}", report.hashes.sha256);
             Ok(())
         }
     }
