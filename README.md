@@ -53,6 +53,45 @@ x86-64/arm64, and macOS x86-64/arm64.
 
 ## CLI
 
+### CTF quick start
+
+Use the cheapest, most attributable searches first and expand only when needed:
+
+```console
+# 1. Inventory partitions, hashes, deleted entries, and ranked anomalies.
+fimg triage challenge.E01 --json --progress
+
+# 2. Search allocated files first; matches include their internal paths.
+fimg hunt challenge.E01 'DFC\{[^}]+\}' --scope files --json --progress
+
+# 3. If that misses, include slack/unallocated bytes in the virtual image.
+fimg hunt challenge.E01 'DFC\{[^}]+\}' --scope raw --json --progress
+
+# 4. Inspect and extract a lead without modifying the image.
+fimg stat challenge.E01 /suspicious/path --partition 2 --json
+fimg extract challenge.E01 /suspicious/path --partition 2 --output ./artifact.bin
+```
+
+For a Codex/agent workflow, attach or name the image and ask it to use
+`$inspect-disk-image`. The skill starts with `triage`, consumes JSON, follows
+ranked leads, and records paths, offsets, partitions, and hashes for a
+reproducible answer. Competition rules still determine whether agent-assisted
+analysis is allowed.
+
+### Command reference
+
+| Command | Purpose |
+| --- | --- |
+| `triage` | Hash and inventory the image, then rank metadata/signature anomalies and deleted evidence. |
+| `hunt` | Regex-search allocated files, raw virtual media, or both; includes UTF-16LE. |
+| `info`, `partitions` | Identify the container, virtual size, partition layout, and filesystem types. |
+| `tree`, `find`, `stat` | Browse paths, regex-search names, and inspect metadata/MAC(B) times. |
+| `timeline` | Export timestamped filesystem activity as text, JSON, or a bodyfile. |
+| `deleted`, `recover` | List deleted nodes and recover a selected readable node by inode or name. |
+| `hash` | Calculate MD5, SHA-1, and SHA-256 for a container, virtual image, or internal file. |
+| `carve`, `raw-extract` | Locate known headers, then copy an explicitly selected virtual byte range. |
+| `extract` | Copy one allocated internal file to an explicit destination. |
+
 ```console
 fimg triage <IMAGE> [--partition N] [--no-hash]
 fimg info <IMAGE>
@@ -125,7 +164,8 @@ The resulting executable is `target/release/fimg` (`fimg.exe` on Windows).
 - Encrypted filesystems and encrypted EWF2 images are rejected.
 - HFS+, APFS, BitLocker/LUKS decryption, XFS, automatic carved-file length
   reconstruction, and alternate data streams are not implemented yet.
-  BitLocker and LUKS headers are detected. Deleted-file enumeration depends on the filesystem: NTFS recovers names,
-  ext/FAT surface bare metadata, and ISO 9660 exposes none.
+  BitLocker and LUKS headers are detected. Deleted-file enumeration depends on
+  the filesystem: NTFS recovers names, ext/FAT surface bare metadata, and ISO
+  9660 exposes none.
 - Treat this as a triage/extraction helper. Verify important forensic results
   with an independent tool.
