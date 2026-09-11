@@ -65,7 +65,7 @@ code — it is the only end-to-end coverage.
 
 ## Architecture
 
-Three layers under `src/`, composed by `main.rs`; `output.rs` renders results:
+The layers under `src/` are composed by `main.rs`; `output.rs` renders results:
 
 1. **`image.rs` — container layer.** `ImageFactory::detect` sniffs the first 512
    bytes plus the file extension to pick `Raw` / `Ewf` / `Vmdk`, then
@@ -102,6 +102,14 @@ Three layers under `src/`, composed by `main.rs`; `output.rs` renders results:
    name + id) and bare `deleted()` (ext/FAT/ISO: `FsMeta`) surfaces, deduped by
    inode.
 
+5. **`digest.rs`, `hunt.rs`, `triage.rs`, and `carve.rs` — CTF analysis.**
+   Hashing calculates MD5/SHA-1/SHA-256 in one pass. Hunt scans bounded chunks
+   with overlap across allocated file streams or decoded virtual media and also
+   checks UTF-16LE. Triage ranks lightweight metadata and signature findings;
+   it deliberately does not duplicate the content hunt. Carve reports header
+   offsets only, leaving exact byte-range extraction to `raw-extract` so the
+   tool never invents an artifact boundary.
+
 Note: `Cargo.toml` aliases `ext4fs-core` → `ext4fs`, `vmdk-core` → `vmdk`, and
 `fat-core` → `fatfs` (its own lib name is the too-generic `fat`).
 
@@ -116,12 +124,14 @@ correct but not cheap on large E01 sets.
 These are product guarantees, not style preferences — do not relax them:
 
 - The source image is opened read-only and never written, renamed, or mounted.
-- `extract` is the only command that writes. It writes to a `NamedTempFile` in
-  the destination directory, `sync_all()`s, then `persist()`s — never a partial
-  file at the destination. It refuses an existing destination unless
-  `--overwrite`, refuses directories, and refuses non-regular-file nodes.
-- Every successful extraction prints the SHA-256 computed *during* the copy in
-  `copy_file`, plus image path, partition, internal path, and size.
+- Only `extract`, `recover`, and `raw-extract` write evidence-derived output,
+  always to an explicit destination. They write to a `NamedTempFile` in the
+  destination directory, `sync_all()` it, then `persist()` it — never a partial
+  file at the destination. They refuse an existing destination unless
+  `--overwrite`; node-based commands also refuse non-regular files.
+- Every successful extraction prints hashes plus image provenance, source path
+  or raw range, and size. Ordinary extraction computes SHA-256 during the copy;
+  raw extraction verifies the completed temporary file before persistence.
 - `try_resolve_path` normalizes `\` to `/` and rejects `..` components outright.
 - Traversal is bounded: `MAX_WALK_DEPTH` 256, `MAX_DIRECTORY_ENTRIES` 1,000,000,
   and a `visited: HashSet<FileId>` guards against directory cycles.
@@ -143,5 +153,7 @@ downloads the latest GitHub release asset **and verifies it against the release
 `SHA256SUMS` before installing** — never relax that check. The `REPOSITORY`
 constant, the per-platform asset names in `asset_name()`, and the release matrix
 in `.github/workflows/release.yml` must stay in sync (Windows x86-64, Linux
-x86-64/arm64, macOS x86-64/arm64). `SKILL.md` encodes the evidence-handling
-rules above for the agent; update it whenever CLI flags or guarantees change.
+x86-64/arm64, macOS x86-64/arm64). `SKILL.md` routes fast CTF triage and
+ordinary evidence handling; detailed challenge workflow lives in
+`references/ctf-workflow.md`. Update both whenever CLI flags or guarantees
+change.

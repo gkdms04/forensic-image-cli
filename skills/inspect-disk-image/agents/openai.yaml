@@ -1,5 +1,4 @@
 interface:
   display_name: "Forensic Disk Image Inspector"
-  short_description: "E01, VMDK, RAW 이미지를 탐색하고 파일 추출"
-  default_prompt: "Use $inspect-disk-image to inspect this forensic disk image and extract the files I request."
-
+  short_description: "CTF 디스크 이미지를 트리아지하고 숨은 증거 복구"
+  default_prompt: "Use $inspect-disk-image to triage this forensic disk image, hunt likely challenge evidence, and report reproducible findings."

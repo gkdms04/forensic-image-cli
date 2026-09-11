@@ -2,9 +2,10 @@
 
 `fimg` is a native Windows, Linux, and macOS, read-only CLI for inspecting
 forensic disk images without mounting them. It is designed for quick terminal
-workflows: show the partition layout, print a file tree, search paths with a
-regular expression, list deleted files, emit a timeline, and extract a selected
-file. Every command can emit JSON with `--json`.
+workflows: run CTF-oriented triage, hunt file or raw content, locate embedded
+file signatures, inspect the partition layout and timeline, recover deleted
+files, and extract selected files or exact byte ranges. Every command can emit
+JSON with `--json`.
 
 Input support:
 
@@ -53,13 +54,19 @@ x86-64/arm64, and macOS x86-64/arm64.
 ## CLI
 
 ```console
+fimg triage <IMAGE> [--partition N] [--no-hash]
 fimg info <IMAGE>
 fimg partitions <IMAGE>
 fimg tree <IMAGE> [--partition N] [--max-depth N]
 fimg find <IMAGE> <PATTERN> [--partition N] [--ignore-case]
+fimg hunt <IMAGE> [PATTERN] [--scope files|raw|all]
+fimg hash <IMAGE> [PATH] [--partition N] [--container]
 fimg stat <IMAGE> <PATH> [--partition N]
 fimg timeline <IMAGE> [--partition N] [--bodyfile]
 fimg deleted <IMAGE> [--partition N]
+fimg recover <IMAGE> (--inode N|--name NAME) --output <DEST>
+fimg carve <IMAGE> [--type TYPE]
+fimg raw-extract <IMAGE> --offset N --length N --output <DEST>
 fimg extract <IMAGE> <PATH> --output <DEST> [--partition N]
 ```
 
@@ -70,17 +77,33 @@ Examples:
 ```console
 fimg tree evidence.E01 --max-depth 5
 fimg find server.vmdk '(?i)\.(docx|pdf)$'
+fimg triage evidence.E01 --json --progress
+fimg hunt evidence.E01 'DFC\{[^}]+\}' --scope files --json
+fimg hunt evidence.E01 'DFC\{[^}]+\}' --scope raw --json
+fimg hash evidence.E01 /Users/Alice/report.docx --json
 fimg stat evidence.E01 /Users/Alice/report.docx --json
 fimg timeline evidence.E01 --bodyfile > bodyfile.txt   # feed Sleuth Kit mactime
 fimg deleted evidence.E01 --partition 2
+fimg recover evidence.E01 --name secret.txt --partition 2 --output secret.txt
+fimg carve evidence.E01 --type pdf --json
+fimg raw-extract evidence.E01 --offset 0x12000 --length 4096 --output candidate.bin
 fimg extract evidence.E01 /Users/Alice/report.docx \
   --partition 3 --output ./report.docx
 ```
 
-The source image is always opened read-only. `extract` is the only command that
-writes evidence-derived data, and it refuses to replace an existing destination
-unless `--overwrite` is supplied. Successful extraction prints the output
-SHA-256.
+The source image is always opened read-only. `extract`, `recover`, and
+`raw-extract` only write evidence-derived data to an explicit destination. They
+refuse to replace an existing destination unless `--overwrite` is supplied and
+print hashes for every successful output.
+
+`triage` calculates all three common CTF hashes, inventories supported
+filesystems, lists deleted evidence, detects BitLocker/LUKS volumes, and ranks
+suspicious paths, file-signature mismatches, hidden names, and timestamp
+anomalies. `hunt` searches allocated file content or the decoded virtual media
+with a byte regex and automatically performs an ASCII/UTF-8 and UTF-16LE pass.
+Both commands bound their result counts for hostile or accidentally broad
+inputs. `carve` reports candidate offsets without guessing file lengths;
+`raw-extract` copies an operator-selected range using decimal or `0x` offsets.
 
 `stat` and `timeline` surface the MAC(B) timestamps preserved by each
 filesystem; a missing time is shown as empty/`null` rather than epoch zero, which
@@ -100,8 +123,9 @@ The resulting executable is `target/release/fimg` (`fimg.exe` on Windows).
 ## Current limits
 
 - Encrypted filesystems and encrypted EWF2 images are rejected.
-- HFS+, APFS, BitLocker, LUKS, and alternate data streams are not implemented
-  yet. Deleted-file enumeration depends on the filesystem: NTFS recovers names,
+- HFS+, APFS, BitLocker/LUKS decryption, XFS, automatic carved-file length
+  reconstruction, and alternate data streams are not implemented yet.
+  BitLocker and LUKS headers are detected. Deleted-file enumeration depends on the filesystem: NTFS recovers names,
   ext/FAT surface bare metadata, and ISO 9660 exposes none.
 - Treat this as a triage/extraction helper. Verify important forensic results
   with an independent tool.
