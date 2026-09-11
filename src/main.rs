@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use forensic_image_cli::digest::{hash_node, hash_reader};
 use forensic_image_cli::filesystem::{
     DeletedEntry, FileSystemKind, copy_file, detect_partition_filesystem, list_deleted,
     try_open_partition_filesystem, try_resolve_path, walk_filesystem,
 };
+use forensic_image_cli::hunt::{HuntReport, ScanOptions, ScanSource, scan_node, scan_reader};
 use forensic_image_cli::image::ImageFactory;
 use forensic_image_cli::output::{
     DeletedRow, ExtractReport, FindMatch, HashReport, InfoPartition, InfoReport, OutputFormat,
@@ -18,6 +19,37 @@ use forensic_image_cli::output::{
 use forensic_image_cli::partition::{Partition, read_partitions};
 use forensic_vfs::{DynFs, NodeKind};
 use regex::RegexBuilder;
+use regex::bytes::RegexBuilder as BytesRegexBuilder;
+
+const DEFAULT_HUNT_PATTERN: &str =
+    r"(?i)(?:flag|ctf|dfc|password|secret|recovery[ _-]?key|bitlocker)";
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum HuntScope {
+    Files,
+    Raw,
+    All,
+}
+
+impl HuntScope {
+    fn includes_files(self) -> bool {
+        matches!(self, Self::Files | Self::All)
+    }
+
+    fn includes_raw(self) -> bool {
+        matches!(self, Self::Raw | Self::All)
+    }
+}
+
+impl std::fmt::Display for HuntScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Files => "files",
+            Self::Raw => "raw",
+            Self::All => "all",
+        })
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -71,6 +103,35 @@ enum Command {
         /// Match without case sensitivity.
         #[arg(short = 'i', long)]
         ignore_case: bool,
+    },
+    /// Search file contents or raw media for CTF flags, secrets, and other regex matches.
+    Hunt {
+        /// E01, VMDK, or raw disk image.
+        image: PathBuf,
+        /// Byte-oriented regular expression (defaults to common CTF evidence keywords).
+        #[arg(default_value = DEFAULT_HUNT_PATTERN)]
+        pattern: String,
+        /// Search allocated files, decoded raw media, or both.
+        #[arg(long, value_enum, default_value_t = HuntScope::Files)]
+        scope: HuntScope,
+        /// Restrict filesystem scanning to one displayed partition number.
+        #[arg(short, long)]
+        partition: Option<usize>,
+        /// Match ASCII without case sensitivity.
+        #[arg(short = 'i', long)]
+        ignore_case: bool,
+        /// Skip allocated files larger than this many bytes (0 means unlimited).
+        #[arg(long, default_value_t = 268_435_456)]
+        max_file_size: u64,
+        /// Stop after this many matches.
+        #[arg(long, default_value_t = 500)]
+        max_matches: usize,
+        /// Printable context characters to retain on each side of a match.
+        #[arg(long, default_value_t = 80)]
+        context: usize,
+        /// Disable the automatic UTF-16LE pass.
+        #[arg(long)]
+        no_utf16: bool,
     },
     /// Show metadata and MAC(B) timestamps for one path.
     Stat {
@@ -170,6 +231,29 @@ fn main() -> Result<()> {
             partition,
             ignore_case,
         } => command_find(&image, &pattern, partition, ignore_case, progress, format),
+        Command::Hunt {
+            image,
+            pattern,
+            scope,
+            partition,
+            ignore_case,
+            max_file_size,
+            max_matches,
+            context,
+            no_utf16,
+        } => command_hunt(
+            &image,
+            &pattern,
+            scope,
+            partition,
+            ignore_case,
+            max_file_size,
+            max_matches,
+            context,
+            !no_utf16,
+            progress,
+            format,
+        ),
         Command::Stat {
             image,
             path,
@@ -556,6 +640,136 @@ fn command_find(
                     entry.partition, entry.kind, entry.size, entry.path
                 );
             }
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn command_hunt(
+    image: &Path,
+    pattern: &str,
+    scope: HuntScope,
+    requested: Option<usize>,
+    ignore_case: bool,
+    max_file_size: u64,
+    max_matches: usize,
+    context: usize,
+    utf16le: bool,
+    show_progress: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    if max_matches == 0 || max_matches > 100_000 {
+        bail!("--max-matches must be between 1 and 100000");
+    }
+    if context > 4096 {
+        bail!("--context cannot exceed 4096");
+    }
+    if requested.is_some() && !scope.includes_files() {
+        bail!("--partition only applies when --scope includes files");
+    }
+    let expression = BytesRegexBuilder::new(pattern)
+        .case_insensitive(ignore_case)
+        .build()
+        .with_context(|| format!("invalid byte regular expression: '{pattern}'"))?;
+    let scan_options = ScanOptions {
+        max_matches,
+        context,
+        utf16le,
+    };
+    let (factory, partitions, _virtual_size) = image_layout(image)?;
+    let mut report = HuntReport::new(pattern, &scope.to_string());
+    let mut progress = Progress::new(show_progress);
+
+    if scope.includes_files() {
+        for_each_readable_partition(
+            &factory,
+            &partitions,
+            requested,
+            |_partition| {},
+            |partition, _kind, filesystem| {
+                walk_filesystem(filesystem.as_ref(), None, |entry| {
+                    progress.tick(partition.number);
+                    if entry.kind != NodeKind::File || report.matches.len() >= max_matches {
+                        return Ok(());
+                    }
+                    if max_file_size != 0 && entry.size > max_file_size {
+                        report.skipped_large_files += 1;
+                        return Ok(());
+                    }
+                    report.scanned_files += 1;
+                    let source = ScanSource {
+                        source: "file",
+                        partition: Some(partition.number),
+                        path: Some(entry.path.clone()),
+                    };
+                    if let Err(error) = scan_node(
+                        filesystem.as_ref(),
+                        entry.id,
+                        entry.size,
+                        &expression,
+                        &source,
+                        scan_options,
+                        &mut report,
+                    ) {
+                        report.unreadable_files += 1;
+                        if format == OutputFormat::Text {
+                            eprintln!(
+                                "warning: cannot scan p{}:{}: {error:#}",
+                                partition.number, entry.path
+                            );
+                        }
+                    }
+                    Ok(())
+                })
+            },
+        )?;
+    }
+
+    if scope.includes_raw() && report.matches.len() < max_matches {
+        let opened = factory.open()?;
+        scan_reader(
+            opened.reader,
+            &expression,
+            &ScanSource {
+                source: "raw",
+                partition: None,
+                path: None,
+            },
+            scan_options,
+            &mut report,
+        )?;
+    }
+    progress.finish();
+
+    match format {
+        OutputFormat::Json => print_json(&report),
+        OutputFormat::Text => {
+            for found in &report.matches {
+                let location = found
+                    .path
+                    .as_deref()
+                    .map(|path| {
+                        format!(
+                            "p{}:{path}",
+                            found
+                                .partition
+                                .map_or("?".to_string(), |value| value.to_string())
+                        )
+                    })
+                    .unwrap_or_else(|| "<virtual-image>".to_string());
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    found.source, location, found.offset, found.encoding, found.context
+                );
+            }
+            eprintln!(
+                "hunt: {} matches, {} files, {} bytes{}",
+                report.matches.len(),
+                report.scanned_files,
+                report.scanned_bytes,
+                if report.truncated { " (truncated)" } else { "" }
+            );
             Ok(())
         }
     }
