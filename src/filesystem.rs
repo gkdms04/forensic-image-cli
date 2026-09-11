@@ -37,6 +37,7 @@ impl std::fmt::Display for FileSystemKind {
 /// bare-[`FsMeta`] and rich [`forensic_vfs::DeletedNode`] surfaces.
 #[derive(Debug, Clone)]
 pub struct DeletedEntry {
+    pub id: Option<FileId>,
     pub ino: u64,
     pub name: Option<String>,
     pub kind: NodeKind,
@@ -349,6 +350,7 @@ pub fn list_deleted(filesystem: &dyn FileSystem) -> Result<Vec<DeletedEntry>> {
         let name =
             (!node.name.is_empty()).then(|| String::from_utf8_lossy(&node.name).into_owned());
         entries.push(DeletedEntry {
+            id: Some(node.id),
             ino: node.meta.ino,
             name,
             kind: node.meta.kind,
@@ -370,6 +372,7 @@ pub fn list_deleted(filesystem: &dyn FileSystem) -> Result<Vec<DeletedEntry>> {
             continue;
         }
         entries.push(DeletedEntry {
+            id: None,
             ino: meta.ino,
             name: None,
             kind: meta.kind,

@@ -4,15 +4,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use forensic_image_cli::digest::{hash_node, hash_reader};
 use forensic_image_cli::filesystem::{
     DeletedEntry, FileSystemKind, copy_file, detect_partition_filesystem, list_deleted,
     try_open_partition_filesystem, try_resolve_path, walk_filesystem,
 };
 use forensic_image_cli::image::ImageFactory;
 use forensic_image_cli::output::{
-    DeletedRow, ExtractReport, FindMatch, InfoPartition, InfoReport, OutputFormat, PartitionRow,
-    StatReport, TimelineRow, TimesReport, TreeNode, TreeReport, allocation_str, format_ts,
-    node_kind_str, print_json, ts_unix_secs,
+    DeletedRow, ExtractReport, FindMatch, HashReport, InfoPartition, InfoReport, OutputFormat,
+    PartitionRow, StatReport, TimelineRow, TimesReport, TreeNode, TreeReport, allocation_str,
+    format_ts, node_kind_str, print_json, ts_unix_secs,
 };
 use forensic_image_cli::partition::{Partition, read_partitions};
 use forensic_vfs::{DynFs, NodeKind};
@@ -100,6 +101,39 @@ enum Command {
         #[arg(short, long)]
         partition: Option<usize>,
     },
+    /// Calculate MD5, SHA-1, and SHA-256 for an image or one internal file.
+    Hash {
+        /// E01, VMDK, or raw disk image.
+        image: PathBuf,
+        /// Optional absolute-style path inside a filesystem.
+        path: Option<String>,
+        /// Restrict lookup to one displayed partition number.
+        #[arg(short, long, requires = "path")]
+        partition: Option<usize>,
+        /// Hash the supplied container file bytes instead of decoded virtual media.
+        #[arg(long, conflicts_with = "path")]
+        container: bool,
+    },
+    /// Recover one readable deleted file by inode/MFT number or recovered name.
+    Recover {
+        /// E01, VMDK, or raw disk image.
+        image: PathBuf,
+        /// Deleted inode or MFT record number.
+        #[arg(long, conflicts_with = "name", required_unless_present = "name")]
+        inode: Option<u64>,
+        /// Recovered deleted filename (must identify exactly one entry).
+        #[arg(long, conflicts_with = "inode", required_unless_present = "inode")]
+        name: Option<String>,
+        /// Destination path on the host.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Restrict lookup to one displayed partition number.
+        #[arg(short, long)]
+        partition: Option<usize>,
+        /// Replace an existing output file.
+        #[arg(long)]
+        overwrite: bool,
+    },
     /// Extract one file by its path inside the image.
     Extract {
         /// E01, VMDK, or raw disk image.
@@ -149,6 +183,28 @@ fn main() -> Result<()> {
         Command::Deleted { image, partition } => {
             command_deleted(&image, partition, progress, format)
         }
+        Command::Hash {
+            image,
+            path,
+            partition,
+            container,
+        } => command_hash(&image, path.as_deref(), partition, container, format),
+        Command::Recover {
+            image,
+            inode,
+            name,
+            output,
+            partition,
+            overwrite,
+        } => command_recover(
+            &image,
+            inode,
+            name.as_deref(),
+            &output,
+            partition,
+            overwrite,
+            format,
+        ),
         Command::Extract {
             image,
             path,
@@ -726,6 +782,190 @@ fn deleted_row(partition: usize, entry: DeletedEntry) -> DeletedRow {
     }
 }
 
+fn command_hash(
+    image: &Path,
+    internal_path: Option<&str>,
+    requested: Option<usize>,
+    container: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    let report = if container {
+        let file = std::fs::File::open(image)
+            .with_context(|| format!("cannot open container '{}'", image.display()))?;
+        let (size, hashes) = hash_reader(file)?;
+        HashReport {
+            source: "container".to_string(),
+            image: image.display().to_string(),
+            partition: None,
+            internal_path: None,
+            size,
+            hashes,
+        }
+    } else if let Some(path) = internal_path {
+        let (factory, partitions, _virtual_size) = image_layout(image)?;
+        let mut found = Vec::new();
+        for_each_readable_partition(
+            &factory,
+            &partitions,
+            requested,
+            |_partition| {},
+            |partition, _kind, filesystem| {
+                if let Some((id, meta)) = try_resolve_path(filesystem.as_ref(), path)? {
+                    found.push((partition.number, filesystem.clone(), id, meta));
+                }
+                Ok(())
+            },
+        )?;
+        if found.is_empty() {
+            bail!("path not found in readable partitions: '{path}'");
+        }
+        if found.len() > 1 {
+            let locations = found
+                .iter()
+                .map(|(number, ..)| format!("p{number}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("path exists in multiple partitions ({locations}); pass --partition");
+        }
+        let (partition, filesystem, id, meta) = found.remove(0);
+        if meta.kind != NodeKind::File {
+            bail!("internal path is not a regular file: '{path}'");
+        }
+        HashReport {
+            source: "file".to_string(),
+            image: factory.path().display().to_string(),
+            partition: Some(partition),
+            internal_path: Some(path.to_string()),
+            size: meta.size,
+            hashes: hash_node(filesystem.as_ref(), id, meta.size)?,
+        }
+    } else {
+        let factory = ImageFactory::detect(image)?;
+        let opened = factory.open()?;
+        let (size, hashes) = hash_reader(opened.reader)?;
+        HashReport {
+            source: "virtual_image".to_string(),
+            image: factory.path().display().to_string(),
+            partition: None,
+            internal_path: None,
+            size,
+            hashes,
+        }
+    };
+
+    match format {
+        OutputFormat::Json => print_json(&report),
+        OutputFormat::Text => {
+            println!("Source: {}", report.source);
+            println!("Image: {}", report.image);
+            if let Some(partition) = report.partition {
+                println!("Partition: p{partition}");
+            }
+            if let Some(path) = &report.internal_path {
+                println!("Internal path: {path}");
+            }
+            println!("Size: {} bytes", report.size);
+            println!("MD5: {}", report.hashes.md5);
+            println!("SHA-1: {}", report.hashes.sha1);
+            println!("SHA-256: {}", report.hashes.sha256);
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn command_recover(
+    image: &Path,
+    inode: Option<u64>,
+    name: Option<&str>,
+    output: &Path,
+    requested: Option<usize>,
+    overwrite: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    validate_destination(output, overwrite)?;
+    let (factory, partitions, _virtual_size) = image_layout(image)?;
+    let mut found = Vec::new();
+    for_each_readable_partition(
+        &factory,
+        &partitions,
+        requested,
+        |_partition| {},
+        |partition, kind, filesystem| {
+            for entry in list_deleted(filesystem.as_ref())? {
+                let matches = inode.is_some_and(|value| entry.ino == value)
+                    || name.is_some_and(|value| {
+                        entry
+                            .name
+                            .as_deref()
+                            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(value))
+                    });
+                if matches {
+                    found.push((partition.clone(), kind, filesystem.clone(), entry));
+                }
+            }
+            Ok(())
+        },
+    )?;
+    if found.is_empty() {
+        bail!("no matching deleted file with readable identity");
+    }
+    if found.len() > 1 {
+        let locations = found
+            .iter()
+            .map(|(partition, _, _, entry)| {
+                format!(
+                    "p{}:{}:{}",
+                    partition.number,
+                    entry.ino,
+                    entry.name.as_deref().unwrap_or("<orphan>")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("deleted selector is ambiguous ({locations}); narrow it with --partition or --inode");
+    }
+
+    let (partition, kind, filesystem, entry) = found.remove(0);
+    if entry.kind != NodeKind::File {
+        bail!("selected deleted node is not a regular file");
+    }
+    let id = entry.id.context(
+        "filesystem reported deleted metadata without a readable identity; recovery is unavailable",
+    )?;
+    let digest = write_node_atomic(filesystem.as_ref(), id, entry.size, output, overwrite)?;
+    let label = entry
+        .name
+        .unwrap_or_else(|| format!("<deleted inode {}>", entry.ino));
+    let report = ExtractReport {
+        extracted: output.display().to_string(),
+        image: factory.path().display().to_string(),
+        partition: partition.number,
+        filesystem: kind.to_string(),
+        internal_path: label,
+        size: entry.size,
+        sha256: hex_digest(&digest),
+    };
+    match format {
+        OutputFormat::Json => print_json(&report),
+        OutputFormat::Text => {
+            println!("Recovered: {}", report.extracted);
+            println!("Image: {}", report.image);
+            println!("Partition: p{} ({})", report.partition, report.filesystem);
+            println!(
+                "Deleted entry: {} (inode/MFT {})",
+                report.internal_path, entry.ino
+            );
+            println!("Size: {} bytes", report.size);
+            println!("SHA-256: {}", report.sha256);
+            println!(
+                "Warning: deleted clusters may have been partially overwritten; verify independently."
+            );
+            Ok(())
+        }
+    }
+}
+
 fn command_extract(
     image: &Path,
     internal_path: &str,
@@ -734,15 +974,7 @@ fn command_extract(
     overwrite: bool,
     format: OutputFormat,
 ) -> Result<()> {
-    if output.exists() && !overwrite {
-        bail!(
-            "destination already exists: '{}'; pass --overwrite to replace it",
-            output.display()
-        );
-    }
-    if output.is_dir() {
-        bail!("destination is a directory: '{}'", output.display());
-    }
+    validate_destination(output, overwrite)?;
     let (factory, partitions, _virtual_size) = image_layout(image)?;
     let mut found = Vec::new();
     for_each_readable_partition(
@@ -773,22 +1005,7 @@ fn command_extract(
     if meta.kind != NodeKind::File {
         bail!("internal path is not a regular file: '{internal_path}'");
     }
-    let parent = output.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("cannot create destination directory '{}'", parent.display()))?;
-    let mut temporary =
-        tempfile::NamedTempFile::new_in(parent).context("cannot create temporary output file")?;
-    let digest = copy_file(filesystem.as_ref(), id, meta.size, temporary.as_file_mut())?;
-    temporary.as_file_mut().flush()?;
-    temporary.as_file_mut().sync_all()?;
-    if output.exists() {
-        std::fs::remove_file(output)
-            .with_context(|| format!("cannot replace destination '{}'", output.display()))?;
-    }
-    temporary
-        .persist(output)
-        .map_err(|error| error.error)
-        .with_context(|| format!("cannot finalize destination '{}'", output.display()))?;
+    let digest = write_node_atomic(filesystem.as_ref(), id, meta.size, output, overwrite)?;
 
     let report = ExtractReport {
         extracted: output.display().to_string(),
@@ -812,6 +1029,47 @@ fn command_extract(
             Ok(())
         }
     }
+}
+
+fn validate_destination(output: &Path, overwrite: bool) -> Result<()> {
+    if output.exists() && !overwrite {
+        bail!(
+            "destination already exists: '{}'; pass --overwrite to replace it",
+            output.display()
+        );
+    }
+    if output.is_dir() {
+        bail!("destination is a directory: '{}'", output.display());
+    }
+    Ok(())
+}
+
+fn write_node_atomic(
+    filesystem: &dyn forensic_vfs::FileSystem,
+    id: forensic_vfs::FileId,
+    size: u64,
+    output: &Path,
+    overwrite: bool,
+) -> Result<[u8; 32]> {
+    validate_destination(output, overwrite)?;
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("cannot create destination directory '{}'", parent.display()))?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).context("cannot create temporary output file")?;
+    let digest = copy_file(filesystem, id, size, temporary.as_file_mut())?;
+    temporary.as_file_mut().flush()?;
+    temporary.as_file_mut().sync_all()?;
+    if output.exists() {
+        std::fs::remove_file(output)
+            .with_context(|| format!("cannot replace destination '{}'", output.display()))?;
+    }
+    temporary
+        .persist(output)
+        .map_err(|error| error.error)
+        .with_context(|| format!("cannot finalize destination '{}'", output.display()))?;
+
+    Ok(digest)
 }
 
 fn print_owner(label: &str, value: Option<u32>) {

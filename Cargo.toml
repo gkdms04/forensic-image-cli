@@ -20,8 +20,10 @@ forensic-vfs = "0.7.0"
 iso9660-forensic = { version = "0.7.5", features = ["vfs"] }
 ntfs-core = { version = "0.9.6", features = ["vfs"] }
 regex = "1.11"
+md5 = { package = "md-5", version = "0.10" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha1 = "0.10"
 sha2 = "0.10"
 tempfile = "3.20"
 vmdk = { package = "vmdk-core", version = "0.8.0" }
