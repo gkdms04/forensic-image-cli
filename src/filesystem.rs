@@ -18,6 +18,8 @@ pub enum FileSystemKind {
     Ext,
     Fat,
     Iso9660,
+    BitLocker,
+    Luks,
     Unknown,
 }
 
@@ -28,6 +30,8 @@ impl std::fmt::Display for FileSystemKind {
             Self::Ext => formatter.write_str("ext2/3/4"),
             Self::Fat => formatter.write_str("FAT/exFAT"),
             Self::Iso9660 => formatter.write_str("ISO 9660"),
+            Self::BitLocker => formatter.write_str("BitLocker"),
+            Self::Luks => formatter.write_str("LUKS"),
             Self::Unknown => formatter.write_str("unknown"),
         }
     }
@@ -99,7 +103,10 @@ pub fn try_open_partition_filesystem(
     let mut reader =
         WindowReader::new(opened.reader, partition.byte_offset(), partition.byte_len());
     let kind = detect_filesystem(&mut reader)?;
-    if kind == FileSystemKind::Unknown {
+    if matches!(
+        kind,
+        FileSystemKind::Unknown | FileSystemKind::BitLocker | FileSystemKind::Luks
+    ) {
         return Ok(None);
     }
     reader.seek(SeekFrom::Start(0))?;
@@ -120,7 +127,9 @@ pub fn try_open_partition_filesystem(
             iso9660_forensic::vfs::IsoVfs::open(reader)
                 .with_context(|| format!("cannot open ISO 9660 in p{}", partition.number))?,
         ),
-        FileSystemKind::Unknown => unreachable!("Unknown handled above"),
+        FileSystemKind::BitLocker | FileSystemKind::Luks | FileSystemKind::Unknown => {
+            unreachable!("unsupported kinds handled above")
+        }
     };
     Ok(Some((kind, filesystem)))
 }
@@ -131,6 +140,12 @@ pub fn detect_filesystem<R: Read + Seek>(reader: &mut R) -> Result<FileSystemKin
     let boot_len = read_up_to(reader, &mut boot)?;
     if boot_len >= 11 && &boot[3..11] == b"NTFS    " {
         return Ok(FileSystemKind::Ntfs);
+    }
+    if boot_len >= 11 && &boot[3..11] == b"-FVE-FS-" {
+        return Ok(FileSystemKind::BitLocker);
+    }
+    if boot_len >= 6 && &boot[..6] == b"LUKS\xba\xbe" {
+        return Ok(FileSystemKind::Luks);
     }
 
     let mut ext_magic = [0_u8; 2];

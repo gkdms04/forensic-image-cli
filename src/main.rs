@@ -17,6 +17,7 @@ use forensic_image_cli::output::{
     format_ts, node_kind_str, print_json, ts_unix_secs,
 };
 use forensic_image_cli::partition::{Partition, read_partitions};
+use forensic_image_cli::triage::{TriageCollector, TriageImage, TriagePartition, TriageReport};
 use forensic_vfs::{DynFs, NodeKind};
 use regex::RegexBuilder;
 use regex::bytes::RegexBuilder as BytesRegexBuilder;
@@ -70,6 +71,20 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run a fast CTF-oriented inventory and suspicious-artifact triage.
+    Triage {
+        /// E01, VMDK, or raw disk image.
+        image: PathBuf,
+        /// Restrict filesystem triage to one displayed partition number.
+        #[arg(short, long)]
+        partition: Option<usize>,
+        /// Skip MD5/SHA-1/SHA-256 calculation over decoded virtual media.
+        #[arg(long)]
+        no_hash: bool,
+        /// Retain at most this many suspicious findings.
+        #[arg(long, default_value_t = 1000)]
+        max_findings: usize,
+    },
     /// Show container, disk, and filesystem metadata.
     Info {
         /// E01, VMDK, or raw disk image.
@@ -218,6 +233,12 @@ fn main() -> Result<()> {
     let format = OutputFormat::from_json_flag(cli.json);
     let progress = cli.progress;
     match cli.command {
+        Command::Triage {
+            image,
+            partition,
+            no_hash,
+            max_findings,
+        } => command_triage(&image, partition, no_hash, max_findings, progress, format),
         Command::Info { image } => command_info(&image, format),
         Command::Partitions { image } => command_partitions(&image, format),
         Command::Tree {
@@ -425,6 +446,175 @@ fn for_each_readable_partition(
         }
     }
     Ok(())
+}
+
+fn command_triage(
+    image: &Path,
+    requested: Option<usize>,
+    no_hash: bool,
+    max_findings: usize,
+    show_progress: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    if max_findings == 0 || max_findings > 100_000 {
+        bail!("--max-findings must be between 1 and 100000");
+    }
+    let (factory, partitions, virtual_size) = image_layout(image)?;
+    let host_size = std::fs::metadata(factory.path())?.len();
+    let virtual_hashes = if no_hash {
+        None
+    } else {
+        let opened = factory.open()?;
+        let (hashed_size, hashes) = hash_reader(opened.reader)?;
+        if hashed_size != virtual_size {
+            bail!(
+                "decoded image size changed while hashing: expected {virtual_size}, read {hashed_size}"
+            );
+        }
+        Some(hashes)
+    };
+
+    let mut partition_reports = Vec::new();
+    for partition in &partitions {
+        partition_reports.push(TriagePartition {
+            number: partition.number,
+            filesystem: detect_partition_filesystem(&factory, partition)?.to_string(),
+            byte_offset: partition.byte_offset(),
+            byte_len: partition.byte_len(),
+            name: partition.name.clone(),
+        });
+    }
+
+    let mut collector = TriageCollector::new(max_findings);
+    let mut progress = Progress::new(show_progress);
+    for partition in select_partitions(&partitions, requested)? {
+        match try_open_partition_filesystem(&factory, partition)? {
+            Some((_kind, filesystem)) => {
+                walk_filesystem(filesystem.as_ref(), None, |entry| {
+                    progress.tick(partition.number);
+                    collector.inspect_entry(partition.number, filesystem.as_ref(), entry);
+                    Ok(())
+                })?;
+                for deleted in list_deleted(filesystem.as_ref())? {
+                    progress.tick(partition.number);
+                    collector.note_deleted(
+                        partition.number,
+                        deleted.ino,
+                        deleted.name.as_deref(),
+                        deleted.size,
+                        deleted.id.is_some() && deleted.kind == NodeKind::File,
+                    );
+                }
+            }
+            None => {
+                let detected = detect_partition_filesystem(&factory, partition)?;
+                let (kind, detail) = match detected {
+                    FileSystemKind::BitLocker => (
+                        "encrypted_bitlocker",
+                        "BitLocker volume detected; search companion memory or key material for a recovery key",
+                    ),
+                    FileSystemKind::Luks => (
+                        "encrypted_luks",
+                        "LUKS volume detected; locate passphrases or key slots before filesystem analysis",
+                    ),
+                    _ => (
+                        "unsupported_filesystem",
+                        "filesystem is unsupported or unrecognized; raw hunt and carving may still find evidence",
+                    ),
+                };
+                collector.note_partition_issue(partition.number, kind, detail.to_string());
+            }
+        }
+    }
+    progress.finish();
+    collector.findings.sort_by(|left, right| {
+        severity_rank(&right.severity)
+            .cmp(&severity_rank(&left.severity))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+
+    let image_arg = factory.path().display().to_string();
+    let report = TriageReport {
+        image: TriageImage {
+            path: image_arg.clone(),
+            container: factory.kind().to_string(),
+            host_size,
+            virtual_size,
+            virtual_hashes,
+        },
+        partitions: partition_reports,
+        summary: collector.summary,
+        findings_truncated: collector.truncated,
+        findings: collector.findings,
+        next_steps: vec![
+            format!("fimg hunt \"{image_arg}\" --scope files --json"),
+            format!("fimg hunt \"{image_arg}\" --scope raw --json"),
+            format!("fimg deleted \"{image_arg}\" --json"),
+            format!("fimg timeline \"{image_arg}\" --json"),
+        ],
+    };
+
+    match format {
+        OutputFormat::Json => print_json(&report),
+        OutputFormat::Text => {
+            println!("Image: {}", report.image.path);
+            println!("Container: {}", report.image.container);
+            println!("Host size: {} bytes", report.image.host_size);
+            println!("Virtual size: {} bytes", report.image.virtual_size);
+            if let Some(hashes) = &report.image.virtual_hashes {
+                println!("Virtual MD5: {}", hashes.md5);
+                println!("Virtual SHA-1: {}", hashes.sha1);
+                println!("Virtual SHA-256: {}", hashes.sha256);
+            }
+            println!("Partitions:");
+            for partition in &report.partitions {
+                println!(
+                    "  p{}\t{}\toffset={}\tbytes={}\t{}",
+                    partition.number,
+                    partition.filesystem,
+                    partition.byte_offset,
+                    partition.byte_len,
+                    partition.name.as_deref().unwrap_or("-")
+                );
+            }
+            println!(
+                "Summary: {} files, {} directories, {} deleted ({} recoverable), {} findings",
+                report.summary.files,
+                report.summary.directories,
+                report.summary.deleted_entries,
+                report.summary.recoverable_deleted_files,
+                report.summary.suspicious_findings
+            );
+            for finding in &report.findings {
+                println!(
+                    "[{}] p{} {} {} -- {}",
+                    finding.severity.to_ascii_uppercase(),
+                    finding.partition,
+                    finding.kind,
+                    finding.path.as_deref().unwrap_or("<partition>"),
+                    finding.detail
+                );
+            }
+            if report.findings_truncated {
+                println!("[!] finding list truncated; raise --max-findings for the full list");
+            }
+            println!("Next steps:");
+            for step in &report.next_steps {
+                println!("  {step}");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn severity_rank(severity: &str) -> u8 {
+    match severity {
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    }
 }
 
 fn command_info(image: &Path, format: OutputFormat) -> Result<()> {
